@@ -1,0 +1,17 @@
+[Unit]
+Description=QRelia network recovery watchdog
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/qrelia/qrelia/setup
+Environment=PYTHONUNBUFFERED=1
+Environment=QRELIA_DISPLAY_STATE_FILE=/tmp/qrelia_display_state.json
+ExecStart=/home/qrelia/qrelia/.venv/bin/python /home/qrelia/qrelia/setup/qrelia_network_watchdog.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

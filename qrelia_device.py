@@ -27,6 +27,7 @@ from rpi_ws281x import PixelStrip
 DEVICE_CONFIG_PATH = Path(os.environ.get("QRELIA_DEVICE_CONFIG_PATH", "/home/qrelia/qreliadevice/qrelia_device_config.json"))
 PROVISIONING_PATH = Path(os.environ.get("QRELIA_PROVISIONING_PATH", "/home/qrelia/qreliadevice/provisioning.json"))
 PROVISIONING_FAILURE_PATH = Path(os.environ.get("QRELIA_PROVISIONING_FAILURE_PATH", "/home/qrelia/qreliadevice/provisioning_error.json"))
+SETUP_DISPLAY_STATE_PATH = Path(os.environ.get("QRELIA_DISPLAY_STATE_FILE", "/tmp/qrelia_display_state.json"))
 DEFAULT_APP_BASE_URL = "https://app.qrelia.uk"
 DEFAULT_ADMIN_BASE_URL = "https://admin.qrelia.uk"
 
@@ -168,6 +169,8 @@ except (TypeError, ValueError):
     SHOWROOM_STRIP_COOPERATIVE_PIXELS = 48
 SHOWROOM_STRIP_COOPERATIVE_PIXELS = max(24, min(144, SHOWROOM_STRIP_COOPERATIVE_PIXELS))
 SETUP_SERVICE = os.environ.get("QRELIA_SETUP_SERVICE", "qrelia-setup-mode.service")
+SETUP_WIFI_SSID = os.environ.get("QRELIA_SETUP_SSID", "QRelia-Setup").strip() or "QRelia-Setup"
+SETUP_WIFI_PASSWORD = os.environ.get("QRELIA_SETUP_PASSWORD", "qrelia1234").strip() or "qrelia1234"
 NETWORK_WATCHDOG_SERVICE = os.environ.get("QRELIA_NETWORK_WATCHDOG_SERVICE", "qrelia-network-watchdog.service")
 TENANT_SERVICE = os.environ.get("QRELIA_TENANT_SERVICE", "qrelia-tenant.service")
 STALE_SECONDS = 600
@@ -301,6 +304,49 @@ def has_pending_provisioning_request():
     return PROVISIONING_PATH.exists()
 
 
+def device_is_in_setup_flow():
+    """True while the LCD should show commissioning instead of live/offline UI."""
+    return (
+        not device_has_runtime_identity()
+        or has_pending_provisioning_request()
+        or provisioning_failure_requires_setup()
+    )
+
+
+def setup_service_active():
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", SETUP_SERVICE],
+            text=True,
+            capture_output=True,
+            timeout=3,
+        )
+        return result.stdout.strip() == "active"
+    except Exception:
+        return False
+
+
+def ensure_setup_mode_available(message="Connect to QRelia-Setup"):
+    """Start captive setup networking without surrendering LCD/GPIO18 ownership."""
+    set_runtime_status("QRelia Setup", message, mode="setup")
+    if setup_service_active():
+        return True
+    try:
+        result = subprocess.run(
+            ["systemctl", "start", SETUP_SERVICE],
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+        if result.returncode == 0:
+            print("QRelia-Setup captive portal started.")
+            return True
+        print("Could not start QRelia setup service:", (result.stderr or result.stdout).strip())
+    except Exception as exc:
+        print("Could not start QRelia setup service:", exc)
+    return False
+
+
 def write_provisioning_failure(message, setup_code="", retryable=False, category="pairing"):
     payload = {
         "message": str(message or "Pairing failed").strip(),
@@ -351,18 +397,11 @@ def claim_network_ready(admin_base_url):
 
 
 def request_setup_mode_after_pairing_failure(message):
-    set_runtime_status("Pairing failed", message or "Open QRelia-Setup", mode="pairing_failed")
-    try:
-        command = (
-            f"systemctl stop {NETWORK_WATCHDOG_SERVICE} || true; "
-            f"systemctl start {SETUP_SERVICE} || true; "
-            f"sleep 2; "
-            f"systemctl stop {TENANT_SERVICE} || true"
-        )
-        subprocess.Popen(command, shell=True)
-        print("Pairing failed; starting setup mode so the venue can correct the setup code/PIN.")
-    except Exception as exc:
-        print("Could not start setup mode after pairing failure:", exc)
+    set_runtime_status("Pairing failed", message or "Open QRelia-Setup", mode="pairing")
+    # LCD generation: tenant remains alive and is the sole LCD/GPIO18 owner.
+    # Setup mode owns only wlan0 + the captive portal.
+    if ensure_setup_mode_available(message or "Fix setup code/PIN"):
+        print("Pairing failed; QRelia-Setup is available for corrected code/PIN.")
 
 
 def claim_device_from_provisioning():
@@ -455,6 +494,7 @@ def claim_device_from_provisioning():
         write_json_file(DEVICE_CONFIG_PATH, config)
         remove_file_if_exists(PROVISIONING_PATH)
         clear_provisioning_failure()
+        remove_file_if_exists(SETUP_DISPLAY_STATE_PATH)
         apply_device_config(config)
         set_runtime_status("QRelia Online", DEVICE_IDENTIFIER or DEVICE_NAME, mode="live")
         print(f"QRelia ambient device provisioned: tenant={TENANT_ID}, device={DEVICE_ID}, identifier={DEVICE_IDENTIFIER or 'n/a'}")
@@ -501,8 +541,7 @@ def acquire_led_strip_lock():
 led_strip_lock_file = acquire_led_strip_lock()
 
 # The LCD generation intentionally has one LED output only: a 144-pixel
-# addressable WS281x/WS2815 strip on BCM GPIO18.  There is no 74HC595, SPI
-# status bar, discrete RGB LED, or secondary LED GPIO engine in this runtime.
+# addressable WS281x/WS2815 strip on BCM GPIO18.
 LED_COUNT = 144
 LED_PIN = 18
 LED_FREQ_HZ = 800000
@@ -631,6 +670,12 @@ def showroom_mode_enabled():
 
 
 def connection_loss_started_at():
+    # During commissioning wlan0 is deliberately switched into AP mode, so a
+    # missing venue SSID/SignalR socket is expected and must not replace SETUP
+    # visuals with a false OFFLINE alarm.
+    if device_is_in_setup_flow():
+        return None
+
     values = [
         value for value in (
             app_signalr_disconnected_since,
@@ -1920,18 +1965,65 @@ def _active_orders_for_lcd():
     return rows
 
 
+def _setup_display_state():
+    state = read_json_file(SETUP_DISPLAY_STATE_PATH)
+    if not state:
+        return {}
+    try:
+        updated = float(state.get("updatedAtUnix") or 0)
+    except (TypeError, ValueError):
+        updated = 0
+    # Setup status is transient coordination state. Ignore ancient leftovers from
+    # a previous boot once the device is otherwise live.
+    if updated and time.time() - updated > 3600:
+        return {}
+    return state
+
+
+def _setup_runtime_copy(title, message, mode, display_state):
+    state = str(display_state.get("state") or "").strip().lower()
+    detail = str(display_state.get("message") or "").strip()
+    titles = {
+        "setup_starting": "Preparing setup",
+        "setup_ready": "QRelia Setup",
+        "phone_connected": "Setup connected",
+        "wifi_form": "Venue WiFi",
+        "saving_wifi": "Saving WiFi",
+        "wifi_failed": "WiFi needs attention",
+        "wifi_verifying": "Checking WiFi",
+        "wifi_verified": "Venue WiFi OK",
+        "rebooting": "Restarting QRelia",
+        "reset_armed": "Reset QRelia",
+        "error": "Setup problem",
+    }
+    if state in titles:
+        title = titles[state]
+    if detail:
+        message = detail
+    if state in ("pairing", "pairing_failed"):
+        mode = "pairing"
+    elif state:
+        mode = "setup"
+    return title, message, mode
+
+
 def _lcd_runtime_snapshot():
     ssid, ip_address = _cached_network_info()
     failure = current_provisioning_failure()
+    setup_state = _setup_display_state() if device_is_in_setup_flow() else {}
+    title, message, mode = _setup_runtime_copy(
+        runtime_status_title, runtime_status_message, runtime_status_mode, setup_state
+    )
+    effective_provisioned = bool(device_has_runtime_identity() and not device_is_in_setup_flow())
     return {
         "deviceName": DEVICE_NAME or DEVICE_IDENTIFIER or "QRelia Device",
         "deviceIdentifier": DEVICE_IDENTIFIER,
         "tenantId": TENANT_ID,
         "deviceId": DEVICE_ID,
         "firmwareVersion": FIRMWARE_VERSION,
-        "runtimeTitle": runtime_status_title,
-        "runtimeMessage": runtime_status_message,
-        "runtimeMode": runtime_status_mode,
+        "runtimeTitle": title,
+        "runtimeMessage": message,
+        "runtimeMode": mode,
         "deviceMode": active_device_mode,
         "showroom": showroom_mode_enabled(),
         "signalRConnected": bool(signalr_connected),
@@ -1948,9 +2040,12 @@ def _lcd_runtime_snapshot():
         "waitingCount": int(waiting_count),
         "activeOrders": _active_orders_for_lcd(),
         "event": _active_lcd_event(),
-        "ssid": ssid,
-        "ipAddress": ip_address,
-        "provisioned": bool(device_has_runtime_identity()),
+        "ssid": str(setup_state.get("ssid") or ssid),
+        "ipAddress": str(setup_state.get("ip") or ip_address),
+        "provisioned": effective_provisioned,
+        "setupState": str(setup_state.get("state") or ""),
+        "setupSsid": SETUP_WIFI_SSID,
+        "setupPassword": SETUP_WIFI_PASSWORD,
         "provisioningFailure": failure,
         "lastUpdateTime": last_update_time,
         "lastSignalRConnectedAt": last_signalr_connected_at,
@@ -3361,9 +3456,11 @@ async def main():
             else:
                 set_network_runtime_status(message)
         else:
-            set_runtime_status("QRelia Setup", "Enter setup code/PIN", mode="setup")
-            print("Waiting for QRelia provisioning. Open QRelia-Setup and enter the setup code/PIN from the admin device order.")
+            set_runtime_status("QRelia Setup", "Connect to QRelia-Setup", mode="setup")
+            await asyncio.to_thread(ensure_setup_mode_available, "Connect to QRelia-Setup")
+            print("Waiting for QRelia provisioning. QRelia-Setup is available for Wi-Fi + setup code/PIN.")
 
+        lcd_update()
         await asyncio.sleep(RECONNECT_SECONDS)
 
     try:

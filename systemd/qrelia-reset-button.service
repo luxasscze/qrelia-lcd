@@ -1,0 +1,20 @@
+[Unit]
+Description=QRelia hardware reset button watcher
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/qrelia/qrelia/setup
+Environment=PYTHONUNBUFFERED=1
+Environment=QRELIA_RESET_BUTTON_GPIO=26
+Environment=QRELIA_RESET_BUTTON_HOLD_SECONDS=7
+Environment=QRELIA_DISPLAY_STATE_FILE=/tmp/qrelia_display_state.json
+Environment=QRELIA_HARD_RESET_SCRIPT=/home/qrelia/qrelia/setup/qrelia_hard_reset_network.sh
+ExecStart=/home/qrelia/qrelia/.venv/bin/python /home/qrelia/qrelia/setup/qrelia_network_reset_button.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

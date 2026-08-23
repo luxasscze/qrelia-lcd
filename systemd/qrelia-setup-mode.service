@@ -1,23 +1,22 @@
 [Unit]
-Description=QRelia LCD Ambient Device
+Description=QRelia LCD captive setup mode
 After=NetworkManager.service
 Wants=NetworkManager.service
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/home/qrelia/qrelia
-ExecStart=/home/qrelia/qrelia/.venv/bin/python /home/qrelia/qrelia/qrelia_tenant.py
-Restart=always
-RestartSec=3
+WorkingDirectory=/home/qrelia/qrelia/setup
 Environment=PYTHONUNBUFFERED=1
-Environment=QRELIA_LCD_FPS=30
 Environment=QRELIA_DISPLAY_STATE_FILE=/tmp/qrelia_display_state.json
 Environment=QRELIA_DEVICE_CONFIG_PATH=/home/qrelia/qreliadevice/qrelia_device_config.json
 Environment=QRELIA_PROVISIONING_PATH=/home/qrelia/qreliadevice/provisioning.json
 Environment=QRELIA_PROVISIONING_FAILURE_PATH=/home/qrelia/qreliadevice/provisioning_error.json
-Environment=QRELIA_PROFILE_PATH=/home/qrelia/qreliadevice/ambient_profile.json
-Environment=QRELIA_CONTROL_PLANE_STATUS_PATH=/home/qrelia/qreliadevice/qrelia_cloud_control_status.json
+Environment=QRELIA_WIFI_SETUP_PENDING_PATH=/home/qrelia/qreliadevice/wifi_setup_pending.json
+Environment=QRELIA_WIFI_SETUP_FAILURE_PATH=/home/qrelia/qreliadevice/wifi_setup_error.json
+ExecStart=/home/qrelia/qrelia/.venv/bin/python /home/qrelia/qrelia/setup/qrelia_setup_mode.py
+Restart=on-failure
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target

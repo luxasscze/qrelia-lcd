@@ -181,9 +181,17 @@ class QReliaLCDDisplay:
         self._card(s,(24,161,432,78),18,PANEL2); self._dot(s,53,199,RED,t); self._txt(s,"RECONNECTING",24,TEXT,78,174); self._txt(s,m.get("runtimeMessage") or "Checking Wi-Fi and cloud",12,SUB,79,210)
         self._footer(s,m.get("ssid") or "Venue Wi-Fi",m.get("ipAddress") or "No network address")
     def _setup(self,s,m,t):
-        self._topbar(s,"setup",BLUE); self._title(s,"Device setup","Connect QRelia to the venue",m.get("runtimeMessage") or "Open QRelia-Setup to continue")
-        self._card(s,(24,159,432,82),18,PANEL); self._txt(s,"QRelia-Setup",22,BLUE,42,174); self._txt(s,"qrelia.local · 192.168.4.1",13,TEXT,42,209); self._packet(s,(309,201),(425,201),t,BLUE)
-        self._footer(s,"Wi-Fi + setup code + PIN","Secure provisioning")
+        state=(m.get("setupState") or "").lower(); title=m.get("runtimeTitle") or "Device setup"; message=m.get("runtimeMessage") or "Open QRelia-Setup to continue"
+        self._topbar(s,"setup",BLUE); self._title(s,"Device setup",title,message)
+        self._card(s,(24,159,432,82),18,PANEL)
+        if state=="reset_armed":
+            self._txt(s,"HOLD RESET",22,AMBER,42,174); self._txt(s,"Release now to cancel",13,TEXT,42,209); self._dot(s,420,201,AMBER,t)
+        elif state in ("saving_wifi","wifi_verifying","wifi_verified","rebooting"):
+            label={"saving_wifi":"SAVING WI-FI","wifi_verifying":"CHECKING WI-FI","wifi_verified":"WI-FI VERIFIED","rebooting":"RESTARTING"}.get(state,"SETUP")
+            self._txt(s,label,22,GREEN if state=="wifi_verified" else BLUE,42,174); self._txt(s,(m.get("ssid") or "Venue network")[:42],13,TEXT,42,209); self._packet(s,(309,201),(425,201),t,BLUE)
+        else:
+            self._txt(s,m.get("setupSsid") or "QRelia-Setup",22,BLUE,42,174); self._txt(s,"qrelia.local · 192.168.4.1",13,TEXT,42,209); self._packet(s,(309,201),(425,201),t,BLUE)
+        self._footer(s,"Wi-Fi + setup code + PIN","Password: " + str(m.get("setupPassword") or "qrelia1234"))
     def _pairing(self,s,m,t):
         self._topbar(s,"pairing",BLUE); self._title(s,"Secure pairing","Linking this display to the venue",m.get("runtimeMessage") or "Validating setup code and PIN")
         self._card(s,(24,159,432,82),18,PANEL2); self._dot(s,56,201,BLUE,t); self._txt(s,"PAIRING",28,TEXT,82,175); self._txt(s,"Claiming device identity",12,SUB,83,211)

@@ -1,0 +1,3253 @@
+diff --git a/README.md b/README.md
+index 34ef7fb..0b802c0 100644
+--- a/README.md
++++ b/README.md
+@@ -1,86 +1,67 @@
+ # QRelia LCD Device
+ 
+-Production QRelia runtime for the 480×320 LCD generation of the ambient device.
++Production runtime for the 480×320 LCD generation of QRelia.
+ 
+ ## Hardware contract
+ 
+-This generation deliberately has one LED output only:
++The tenant runtime has a single LED output: a **144-pixel WS281x/WS2815 strip on BCM GPIO18 (physical pin 12)**. The LCD is the operational display. The hard-reset button remains an input on BCM GPIO26.
+ 
+-- **144-pixel addressable WS281x/WS2815 strip**
+-- **BCM GPIO18 / physical pin 12**
+-- 800 kHz, DMA 10, channel 0
++The LCD and GPIO18 are always owned by `qrelia-tenant.service`. Setup mode owns only wlan0, DHCP/DNS and the captive portal, so commissioning cannot create a second LED/display renderer.
+ 
+-There is **no 74HC595 shift register**, no eight-channel status bar, no SPI LED engine, and no separate common-anode/discrete RGB LED engine in this repository. The LCD is the operational status surface; GPIO18 is the only LED-output GPIO owned by the tenant runtime.
++## Runtime layout
+ 
+-The existing network-reset/setup hardware is a separate provisioning concern and can remain in the original QRelia setup installation.
+-
+-## What is included
+-
+-- QRelia provisioning/claim handling and persisted device identity
+-- app and admin control-plane endpoints
+-- SignalR negotiation, registration, reconnect and protocol keepalive
+-- REST order reconciliation
+-- Pending / Processing / Waiting / Completed / Cancelled order state handling
+-- stale-order detection
+-- heartbeat and cloud-control diagnostics
+-- ambient profiles, live profile updates and profile previews
+-- Live Service and Showroom device modes
+-- Wi-Fi/cloud connection-loss grace and recovery logic
+-- 144-pixel GPIO18 ambient animation engine and the production 100-animation catalogues
+-- 480×320 LCD operational renderer based on `qrelia_showroom_ultra_v2.py`
+-
+-## Raspberry Pi paths
+-
+-The new LCD repository is expected at:
++Application code:
+ 
+ ```text
+ /home/qrelia/qrelia
+ ```
+ 
+-The supplied `qrelia-tenant.service` runs:
++Persistent device identity/profile state remains compatible with the original QRelia image:
+ 
+ ```text
+-/home/qrelia/qrelia/qrelia_tenant.py
++/home/qrelia/qreliadevice
+ ```
+ 
+-For an existing QRelia device migration, the service intentionally continues to read the already-established provisioning/device state from:
++Important services:
+ 
+ ```text
+-/home/qrelia/qreliadevice/
++qrelia-tenant.service
++qrelia-setup-mode.service
++qrelia-network-watchdog.service
++qrelia-reset-button.service
+ ```
+ 
+-That preserves the device claim and remains compatible with the original setup stack instead of forcing the venue to pair the device again.
++`qrelia-setup-mode.service` is intentionally not enabled at boot. The tenant/watchdog starts it automatically when the device has no saved Wi-Fi/claim or pairing needs correction.
+ 
+-## Install Python dependencies
++## Installation
++
++From the repository:
+ 
+ ```bash
+ cd ~/qrelia
+-sudo python3 -m pip install -r requirements.txt
++sudo ./install_device.sh
+ ```
+ 
+-`rpi-ws281x` on GPIO18 requires the hardware permissions normally provided by root, so the supplied systemd unit runs the production runtime as `root`.
++The installer uses `/home/qrelia/qrelia/.venv`, installs the captive-portal networking dependencies, installs the systemd units, and enables the tenant/watchdog/reset-button services.
+ 
+-## Install/reinstall the service
++## First boot
+ 
+-```bash
+-cd ~/qrelia
+-sudo cp qrelia-tenant.service /etc/systemd/system/qrelia-tenant.service
+-sudo systemctl daemon-reload
+-sudo systemctl enable qrelia-tenant.service
+-sudo systemctl restart qrelia-tenant.service
+-sudo systemctl status qrelia-tenant.service --no-pager -l
+-```
++An unpaired device automatically starts the `QRelia-Setup` access point. The LCD displays the setup state and portal address. Connect a phone to `QRelia-Setup`, open `http://qrelia.local/` (or `http://192.168.4.1/`), select venue Wi-Fi and enter the QRelia setup code/PIN.
++
++The captive portal writes the same provisioning contract used by the original device. After restart the tenant claims the device, persists tenant/device identity, loads its ambient profile, starts heartbeat and SignalR, and reconciles active orders.
+ 
+-Follow logs with:
++## Diagnostics
+ 
+ ```bash
++sudo systemctl status qrelia-tenant.service --no-pager -l
++sudo systemctl status qrelia-setup-mode.service --no-pager -l
++sudo systemctl status qrelia-network-watchdog.service --no-pager -l
+ sudo journalctl -u qrelia-tenant.service -f
++sudo journalctl -u qrelia-setup-mode.service -f
+ ```
+ 
+-## GPIO18 ownership
+-
+-The runtime takes an exclusive process lock at `/tmp/qrelia-led-strip.lock` before initializing the strip. This prevents two QRelia processes from driving GPIO18 simultaneously. The old setup/status-strip process must not independently drive GPIO18 while the LCD tenant runtime owns it.
++Persistent claim files can be inspected with:
+ 
+-## LCD
+-
+-`qrelia_lcd.py` is the production data-driven renderer. `qrelia_showroom_ultra_v2.py` remains the visual reference/showcase script and is not the production state machine.
++```bash
++sudo ls -la /home/qrelia/qreliadevice
++```
+diff --git a/install_device.sh b/install_device.sh
+new file mode 100755
+index 0000000..4889450
+--- /dev/null
++++ b/install_device.sh
+@@ -0,0 +1,53 @@
++#!/bin/bash
++set -euo pipefail
++
++if [ "${EUID}" -ne 0 ]; then
++  echo "Run with sudo: sudo ./install_device.sh"
++  exit 1
++fi
++
++APP_DIR="/home/qrelia/qrelia"
++VENV="$APP_DIR/.venv"
++STATE_DIR="/home/qrelia/qreliadevice"
++
++if [ ! -d "$APP_DIR" ]; then
++  echo "Expected QRelia LCD repo at $APP_DIR"
++  exit 1
++fi
++
++apt-get update
++apt-get install -y python3-venv python3-full python3-dev build-essential hostapd dnsmasq iw network-manager
++
++# QRelia launches private hostapd/dnsmasq instances only during setup.
++systemctl disable --now hostapd 2>/dev/null || true
++systemctl disable --now dnsmasq 2>/dev/null || true
++
++if [ ! -x "$VENV/bin/python" ]; then
++  sudo -u qrelia python3 -m venv --system-site-packages "$VENV"
++fi
++sudo -u qrelia "$VENV/bin/python" -m pip install --upgrade pip setuptools wheel
++sudo -u qrelia "$VENV/bin/pip" install -r "$APP_DIR/requirements.txt"
++
++mkdir -p "$STATE_DIR"
++chown qrelia:qrelia "$STATE_DIR"
++chmod 755 "$STATE_DIR"
++chmod +x "$APP_DIR/setup/qrelia_setup_mode.py" "$APP_DIR/setup/qrelia_hard_reset_network.sh"
++
++install -m 0644 "$APP_DIR/qrelia-tenant.service" /etc/systemd/system/qrelia-tenant.service
++install -m 0644 "$APP_DIR/systemd/qrelia-setup-mode.service" /etc/systemd/system/qrelia-setup-mode.service
++install -m 0644 "$APP_DIR/systemd/qrelia-network-watchdog.service" /etc/systemd/system/qrelia-network-watchdog.service
++install -m 0644 "$APP_DIR/systemd/qrelia-reset-button.service" /etc/systemd/system/qrelia-reset-button.service
++
++systemctl daemon-reload
++systemctl enable qrelia-tenant.service qrelia-network-watchdog.service qrelia-reset-button.service
++# Setup mode is intentionally not enabled: tenant/watchdog starts it only when needed.
++systemctl disable qrelia-setup-mode.service 2>/dev/null || true
++systemctl restart qrelia-tenant.service
++systemctl restart qrelia-network-watchdog.service
++systemctl restart qrelia-reset-button.service
++
++echo
++echo "QRelia LCD services installed."
++echo "Tenant:   systemctl status qrelia-tenant.service"
++echo "Setup:    systemctl status qrelia-setup-mode.service"
++echo "Watchdog: systemctl status qrelia-network-watchdog.service"
+diff --git a/qrelia-tenant.service b/qrelia-tenant.service
+index 4be4c0b..71afe0a 100644
+--- a/qrelia-tenant.service
++++ b/qrelia-tenant.service
+@@ -1,19 +1,18 @@
+ [Unit]
+ Description=QRelia LCD Ambient Device
+-After=network-online.target
+-Wants=network-online.target
++After=NetworkManager.service
++Wants=NetworkManager.service
+ 
+ [Service]
+ Type=simple
+ User=root
+ WorkingDirectory=/home/qrelia/qrelia
+-ExecStart=/usr/bin/python3 /home/qrelia/qrelia/qrelia_tenant.py
++ExecStart=/home/qrelia/qrelia/.venv/bin/python /home/qrelia/qrelia/qrelia_tenant.py
+ Restart=always
+ RestartSec=3
+ Environment=PYTHONUNBUFFERED=1
+ Environment=QRELIA_LCD_FPS=30
+-# Keep compatibility with the existing production device identity/provisioning
+-# written by the original QRelia setup stack.
++Environment=QRELIA_DISPLAY_STATE_FILE=/tmp/qrelia_display_state.json
+ Environment=QRELIA_DEVICE_CONFIG_PATH=/home/qrelia/qreliadevice/qrelia_device_config.json
+ Environment=QRELIA_PROVISIONING_PATH=/home/qrelia/qreliadevice/provisioning.json
+ Environment=QRELIA_PROVISIONING_FAILURE_PATH=/home/qrelia/qreliadevice/provisioning_error.json
+diff --git a/qrelia_device.py b/qrelia_device.py
+index 1e8fc52..89d72c4 100755
+--- a/qrelia_device.py
++++ b/qrelia_device.py
+@@ -27,6 +27,7 @@ from rpi_ws281x import PixelStrip
+ DEVICE_CONFIG_PATH = Path(os.environ.get("QRELIA_DEVICE_CONFIG_PATH", "/home/qrelia/qreliadevice/qrelia_device_config.json"))
+ PROVISIONING_PATH = Path(os.environ.get("QRELIA_PROVISIONING_PATH", "/home/qrelia/qreliadevice/provisioning.json"))
+ PROVISIONING_FAILURE_PATH = Path(os.environ.get("QRELIA_PROVISIONING_FAILURE_PATH", "/home/qrelia/qreliadevice/provisioning_error.json"))
++SETUP_DISPLAY_STATE_PATH = Path(os.environ.get("QRELIA_DISPLAY_STATE_FILE", "/tmp/qrelia_display_state.json"))
+ DEFAULT_APP_BASE_URL = "https://app.qrelia.uk"
+ DEFAULT_ADMIN_BASE_URL = "https://admin.qrelia.uk"
+ 
+@@ -168,6 +169,8 @@ except (TypeError, ValueError):
+     SHOWROOM_STRIP_COOPERATIVE_PIXELS = 48
+ SHOWROOM_STRIP_COOPERATIVE_PIXELS = max(24, min(144, SHOWROOM_STRIP_COOPERATIVE_PIXELS))
+ SETUP_SERVICE = os.environ.get("QRELIA_SETUP_SERVICE", "qrelia-setup-mode.service")
++SETUP_WIFI_SSID = os.environ.get("QRELIA_SETUP_SSID", "QRelia-Setup").strip() or "QRelia-Setup"
++SETUP_WIFI_PASSWORD = os.environ.get("QRELIA_SETUP_PASSWORD", "qrelia1234").strip() or "qrelia1234"
+ NETWORK_WATCHDOG_SERVICE = os.environ.get("QRELIA_NETWORK_WATCHDOG_SERVICE", "qrelia-network-watchdog.service")
+ TENANT_SERVICE = os.environ.get("QRELIA_TENANT_SERVICE", "qrelia-tenant.service")
+ STALE_SECONDS = 600
+@@ -301,6 +304,49 @@ def has_pending_provisioning_request():
+     return PROVISIONING_PATH.exists()
+ 
+ 
++def device_is_in_setup_flow():
++    """True while the LCD should show commissioning instead of live/offline UI."""
++    return (
++        not device_has_runtime_identity()
++        or has_pending_provisioning_request()
++        or provisioning_failure_requires_setup()
++    )
++
++
++def setup_service_active():
++    try:
++        result = subprocess.run(
++            ["systemctl", "is-active", SETUP_SERVICE],
++            text=True,
++            capture_output=True,
++            timeout=3,
++        )
++        return result.stdout.strip() == "active"
++    except Exception:
++        return False
++
++
++def ensure_setup_mode_available(message="Connect to QRelia-Setup"):
++    """Start captive setup networking without surrendering LCD/GPIO18 ownership."""
++    set_runtime_status("QRelia Setup", message, mode="setup")
++    if setup_service_active():
++        return True
++    try:
++        result = subprocess.run(
++            ["systemctl", "start", SETUP_SERVICE],
++            text=True,
++            capture_output=True,
++            timeout=15,
++        )
++        if result.returncode == 0:
++            print("QRelia-Setup captive portal started.")
++            return True
++        print("Could not start QRelia setup service:", (result.stderr or result.stdout).strip())
++    except Exception as exc:
++        print("Could not start QRelia setup service:", exc)
++    return False
++
++
+ def write_provisioning_failure(message, setup_code="", retryable=False, category="pairing"):
+     payload = {
+         "message": str(message or "Pairing failed").strip(),
+@@ -351,18 +397,11 @@ def claim_network_ready(admin_base_url):
+ 
+ 
+ def request_setup_mode_after_pairing_failure(message):
+-    set_runtime_status("Pairing failed", message or "Open QRelia-Setup", mode="pairing_failed")
+-    try:
+-        command = (
+-            f"systemctl stop {NETWORK_WATCHDOG_SERVICE} || true; "
+-            f"systemctl start {SETUP_SERVICE} || true; "
+-            f"sleep 2; "
+-            f"systemctl stop {TENANT_SERVICE} || true"
+-        )
+-        subprocess.Popen(command, shell=True)
+-        print("Pairing failed; starting setup mode so the venue can correct the setup code/PIN.")
+-    except Exception as exc:
+-        print("Could not start setup mode after pairing failure:", exc)
++    set_runtime_status("Pairing failed", message or "Open QRelia-Setup", mode="pairing")
++    # LCD generation: tenant remains alive and is the sole LCD/GPIO18 owner.
++    # Setup mode owns only wlan0 + the captive portal.
++    if ensure_setup_mode_available(message or "Fix setup code/PIN"):
++        print("Pairing failed; QRelia-Setup is available for corrected code/PIN.")
+ 
+ 
+ def claim_device_from_provisioning():
+@@ -455,6 +494,7 @@ def claim_device_from_provisioning():
+         write_json_file(DEVICE_CONFIG_PATH, config)
+         remove_file_if_exists(PROVISIONING_PATH)
+         clear_provisioning_failure()
++        remove_file_if_exists(SETUP_DISPLAY_STATE_PATH)
+         apply_device_config(config)
+         set_runtime_status("QRelia Online", DEVICE_IDENTIFIER or DEVICE_NAME, mode="live")
+         print(f"QRelia ambient device provisioned: tenant={TENANT_ID}, device={DEVICE_ID}, identifier={DEVICE_IDENTIFIER or 'n/a'}")
+@@ -501,8 +541,7 @@ def acquire_led_strip_lock():
+ led_strip_lock_file = acquire_led_strip_lock()
+ 
+ # The LCD generation intentionally has one LED output only: a 144-pixel
+-# addressable WS281x/WS2815 strip on BCM GPIO18.  There is no 74HC595, SPI
+-# status bar, discrete RGB LED, or secondary LED GPIO engine in this runtime.
++# addressable WS281x/WS2815 strip on BCM GPIO18.
+ LED_COUNT = 144
+ LED_PIN = 18
+ LED_FREQ_HZ = 800000
+@@ -631,6 +670,12 @@ def showroom_mode_enabled():
+ 
+ 
+ def connection_loss_started_at():
++    # During commissioning wlan0 is deliberately switched into AP mode, so a
++    # missing venue SSID/SignalR socket is expected and must not replace SETUP
++    # visuals with a false OFFLINE alarm.
++    if device_is_in_setup_flow():
++        return None
++
+     values = [
+         value for value in (
+             app_signalr_disconnected_since,
+@@ -1920,18 +1965,65 @@ def _active_orders_for_lcd():
+     return rows
+ 
+ 
++def _setup_display_state():
++    state = read_json_file(SETUP_DISPLAY_STATE_PATH)
++    if not state:
++        return {}
++    try:
++        updated = float(state.get("updatedAtUnix") or 0)
++    except (TypeError, ValueError):
++        updated = 0
++    # Setup status is transient coordination state. Ignore ancient leftovers from
++    # a previous boot once the device is otherwise live.
++    if updated and time.time() - updated > 3600:
++        return {}
++    return state
++
++
++def _setup_runtime_copy(title, message, mode, display_state):
++    state = str(display_state.get("state") or "").strip().lower()
++    detail = str(display_state.get("message") or "").strip()
++    titles = {
++        "setup_starting": "Preparing setup",
++        "setup_ready": "QRelia Setup",
++        "phone_connected": "Setup connected",
++        "wifi_form": "Venue WiFi",
++        "saving_wifi": "Saving WiFi",
++        "wifi_failed": "WiFi needs attention",
++        "wifi_verifying": "Checking WiFi",
++        "wifi_verified": "Venue WiFi OK",
++        "rebooting": "Restarting QRelia",
++        "reset_armed": "Reset QRelia",
++        "error": "Setup problem",
++    }
++    if state in titles:
++        title = titles[state]
++    if detail:
++        message = detail
++    if state in ("pairing", "pairing_failed"):
++        mode = "pairing"
++    elif state:
++        mode = "setup"
++    return title, message, mode
++
++
+ def _lcd_runtime_snapshot():
+     ssid, ip_address = _cached_network_info()
+     failure = current_provisioning_failure()
++    setup_state = _setup_display_state() if device_is_in_setup_flow() else {}
++    title, message, mode = _setup_runtime_copy(
++        runtime_status_title, runtime_status_message, runtime_status_mode, setup_state
++    )
++    effective_provisioned = bool(device_has_runtime_identity() and not device_is_in_setup_flow())
+     return {
+         "deviceName": DEVICE_NAME or DEVICE_IDENTIFIER or "QRelia Device",
+         "deviceIdentifier": DEVICE_IDENTIFIER,
+         "tenantId": TENANT_ID,
+         "deviceId": DEVICE_ID,
+         "firmwareVersion": FIRMWARE_VERSION,
+-        "runtimeTitle": runtime_status_title,
+-        "runtimeMessage": runtime_status_message,
+-        "runtimeMode": runtime_status_mode,
++        "runtimeTitle": title,
++        "runtimeMessage": message,
++        "runtimeMode": mode,
+         "deviceMode": active_device_mode,
+         "showroom": showroom_mode_enabled(),
+         "signalRConnected": bool(signalr_connected),
+@@ -1948,9 +2040,12 @@ def _lcd_runtime_snapshot():
+         "waitingCount": int(waiting_count),
+         "activeOrders": _active_orders_for_lcd(),
+         "event": _active_lcd_event(),
+-        "ssid": ssid,
+-        "ipAddress": ip_address,
+-        "provisioned": bool(device_has_runtime_identity()),
++        "ssid": str(setup_state.get("ssid") or ssid),
++        "ipAddress": str(setup_state.get("ip") or ip_address),
++        "provisioned": effective_provisioned,
++        "setupState": str(setup_state.get("state") or ""),
++        "setupSsid": SETUP_WIFI_SSID,
++        "setupPassword": SETUP_WIFI_PASSWORD,
+         "provisioningFailure": failure,
+         "lastUpdateTime": last_update_time,
+         "lastSignalRConnectedAt": last_signalr_connected_at,
+@@ -3361,9 +3456,11 @@ async def main():
+             else:
+                 set_network_runtime_status(message)
+         else:
+-            set_runtime_status("QRelia Setup", "Enter setup code/PIN", mode="setup")
+-            print("Waiting for QRelia provisioning. Open QRelia-Setup and enter the setup code/PIN from the admin device order.")
++            set_runtime_status("QRelia Setup", "Connect to QRelia-Setup", mode="setup")
++            await asyncio.to_thread(ensure_setup_mode_available, "Connect to QRelia-Setup")
++            print("Waiting for QRelia provisioning. QRelia-Setup is available for Wi-Fi + setup code/PIN.")
+ 
++        lcd_update()
+         await asyncio.sleep(RECONNECT_SECONDS)
+ 
+     try:
+diff --git a/qrelia_lcd.py b/qrelia_lcd.py
+index 0512a49..4454902 100644
+--- a/qrelia_lcd.py
++++ b/qrelia_lcd.py
+@@ -181,9 +181,17 @@ class QReliaLCDDisplay:
+         self._card(s,(24,161,432,78),18,PANEL2); self._dot(s,53,199,RED,t); self._txt(s,"RECONNECTING",24,TEXT,78,174); self._txt(s,m.get("runtimeMessage") or "Checking Wi-Fi and cloud",12,SUB,79,210)
+         self._footer(s,m.get("ssid") or "Venue Wi-Fi",m.get("ipAddress") or "No network address")
+     def _setup(self,s,m,t):
+-        self._topbar(s,"setup",BLUE); self._title(s,"Device setup","Connect QRelia to the venue",m.get("runtimeMessage") or "Open QRelia-Setup to continue")
+-        self._card(s,(24,159,432,82),18,PANEL); self._txt(s,"QRelia-Setup",22,BLUE,42,174); self._txt(s,"qrelia.local · 192.168.4.1",13,TEXT,42,209); self._packet(s,(309,201),(425,201),t,BLUE)
+-        self._footer(s,"Wi-Fi + setup code + PIN","Secure provisioning")
++        state=(m.get("setupState") or "").lower(); title=m.get("runtimeTitle") or "Device setup"; message=m.get("runtimeMessage") or "Open QRelia-Setup to continue"
++        self._topbar(s,"setup",BLUE); self._title(s,"Device setup",title,message)
++        self._card(s,(24,159,432,82),18,PANEL)
++        if state=="reset_armed":
++            self._txt(s,"HOLD RESET",22,AMBER,42,174); self._txt(s,"Release now to cancel",13,TEXT,42,209); self._dot(s,420,201,AMBER,t)
++        elif state in ("saving_wifi","wifi_verifying","wifi_verified","rebooting"):
++            label={"saving_wifi":"SAVING WI-FI","wifi_verifying":"CHECKING WI-FI","wifi_verified":"WI-FI VERIFIED","rebooting":"RESTARTING"}.get(state,"SETUP")
++            self._txt(s,label,22,GREEN if state=="wifi_verified" else BLUE,42,174); self._txt(s,(m.get("ssid") or "Venue network")[:42],13,TEXT,42,209); self._packet(s,(309,201),(425,201),t,BLUE)
++        else:
++            self._txt(s,m.get("setupSsid") or "QRelia-Setup",22,BLUE,42,174); self._txt(s,"qrelia.local · 192.168.4.1",13,TEXT,42,209); self._packet(s,(309,201),(425,201),t,BLUE)
++        self._footer(s,"Wi-Fi + setup code + PIN","Password: " + str(m.get("setupPassword") or "qrelia1234"))
+     def _pairing(self,s,m,t):
+         self._topbar(s,"pairing",BLUE); self._title(s,"Secure pairing","Linking this display to the venue",m.get("runtimeMessage") or "Validating setup code and PIN")
+         self._card(s,(24,159,432,82),18,PANEL2); self._dot(s,56,201,BLUE,t); self._txt(s,"PAIRING",28,TEXT,82,175); self._txt(s,"Claiming device identity",12,SUB,83,211)
+diff --git a/requirements.txt b/requirements.txt
+index 55de19e..b226b60 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -2,3 +2,5 @@ requests>=2.31,<3
+ websockets>=12,<16
+ pygame>=2.5,<3
+ rpi-ws281x>=5,<6
++Flask>=3,<4
++gpiozero>=2,<3
+diff --git a/setup/display_state.py b/setup/display_state.py
+new file mode 100644
+index 0000000..c576102
+--- /dev/null
++++ b/setup/display_state.py
+@@ -0,0 +1,35 @@
++#!/usr/bin/env python3
++"""Shared setup/status state consumed by the production LCD runtime."""
++import json
++import os
++import time
++from pathlib import Path
++
++DISPLAY_STATE_FILE = Path(os.environ.get("QRELIA_DISPLAY_STATE_FILE", "/tmp/qrelia_display_state.json"))
++
++def set_display_state(state, ssid="", message="", ip=""):
++    payload = {
++        "state": str(state or ""),
++        "ssid": str(ssid or ""),
++        "message": str(message or ""),
++        "ip": str(ip or ""),
++        "updatedAtUnix": time.time(),
++    }
++    DISPLAY_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
++    temp = DISPLAY_STATE_FILE.with_suffix(DISPLAY_STATE_FILE.suffix + ".tmp")
++    temp.write_text(json.dumps(payload), encoding="utf-8")
++    temp.replace(DISPLAY_STATE_FILE)
++    try:
++        os.chmod(DISPLAY_STATE_FILE, 0o644)
++    except Exception:
++        pass
++    return payload
++
++def read_display_state():
++    try:
++        if DISPLAY_STATE_FILE.exists():
++            data = json.loads(DISPLAY_STATE_FILE.read_text(encoding="utf-8"))
++            return data if isinstance(data, dict) else {}
++    except Exception:
++        pass
++    return {}
+diff --git a/setup/qrelia_hard_reset_network.sh b/setup/qrelia_hard_reset_network.sh
+new file mode 100755
+index 0000000..546598d
+--- /dev/null
++++ b/setup/qrelia_hard_reset_network.sh
+@@ -0,0 +1,66 @@
++#!/bin/bash
++set -euo pipefail
++
++echo "[QRelia Reset] Starting network + pairing hard reset..."
++
++DISPLAY_STATE_FILE="${QRELIA_DISPLAY_STATE_FILE:-/tmp/qrelia_display_state.json}"
++STATE_DIR="${QRELIA_STATE_DIR:-/home/qrelia/qreliadevice}"
++DEVICE_CONFIG_PATH="${QRELIA_DEVICE_CONFIG_PATH:-$STATE_DIR/qrelia_device_config.json}"
++PROVISIONING_PATH="${QRELIA_PROVISIONING_PATH:-$STATE_DIR/provisioning.json}"
++PROVISIONING_FAILURE_PATH="${QRELIA_PROVISIONING_FAILURE_PATH:-$STATE_DIR/provisioning_error.json}"
++WIFI_SETUP_PENDING_PATH="${QRELIA_WIFI_SETUP_PENDING_PATH:-$STATE_DIR/wifi_setup_pending.json}"
++WIFI_SETUP_FAILURE_PATH="${QRELIA_WIFI_SETUP_FAILURE_PATH:-$STATE_DIR/wifi_setup_error.json}"
++AMBIENT_PROFILE_PATH="${QRELIA_PROFILE_PATH:-$STATE_DIR/ambient_profile.json}"
++CONTROL_STATUS_PATH="${QRELIA_CONTROL_PLANE_STATUS_PATH:-$STATE_DIR/qrelia_cloud_control_status.json}"
++
++WATCHDOG_SERVICE="qrelia-network-watchdog.service"
++SETUP_SERVICE="qrelia-setup-mode.service"
++TENANT_SERVICE="qrelia-tenant.service"
++
++write_state() {
++  local state="$1" message="$2" ip="${3:-}"
++  cat > "$DISPLAY_STATE_FILE" <<EOF
++{"state":"$state","ssid":"","message":"$message","ip":"$ip"}
++EOF
++}
++
++echo "[QRelia Reset] Stopping watchdog + tenant while identity is erased..."
++systemctl stop "$WATCHDOG_SERVICE" || true
++systemctl stop "$TENANT_SERVICE" || true
++systemctl stop "$SETUP_SERVICE" || true
++write_state "setup_starting" "Resetting QRelia"
++
++mkdir -p "$STATE_DIR"
++echo "[QRelia Reset] Erasing QRelia pairing/profile state..."
++rm -f \
++  "$DEVICE_CONFIG_PATH" \
++  "$PROVISIONING_PATH" \
++  "$PROVISIONING_FAILURE_PATH" \
++  "$WIFI_SETUP_PENDING_PATH" \
++  "$WIFI_SETUP_FAILURE_PATH" \
++  "$AMBIENT_PROFILE_PATH" \
++  "$CONTROL_STATUS_PATH" || true
++
++echo "[QRelia Reset] Removing saved Wi-Fi profiles..."
++while IFS= read -r connection; do
++  [ -n "$connection" ] || continue
++  echo "[QRelia Reset] Deleting Wi-Fi profile: $connection"
++  nmcli connection delete "$connection" || true
++done < <(nmcli -t -f NAME,TYPE connection show | awk -F: '$2=="802-11-wireless" || $2=="wifi" || $2=="wireless" {print $1}')
++
++rm -f /etc/wpa_supplicant/wpa_supplicant.conf.qrelia-backup || true
++rm -f /etc/netplan/99-qrelia-wifi.yaml /etc/netplan/99-qrelia-venue-wifi.yaml || true
++
++nmcli dev set wlan0 managed yes || true
++nmcli radio wifi on || true
++systemctl restart NetworkManager || true
++sleep 2
++
++echo "[QRelia Reset] Starting clean LCD runtime + setup portal..."
++systemctl reset-failed "$TENANT_SERVICE" || true
++systemctl start "$TENANT_SERVICE"
++systemctl start "$SETUP_SERVICE"
++systemctl start "$WATCHDOG_SERVICE"
++write_state "setup_ready" "Connect to QRelia-Setup" "192.168.4.1"
++
++echo "[QRelia Reset] Complete. Device is unpaired and in setup mode."
+diff --git a/setup/qrelia_network_reset_button.py b/setup/qrelia_network_reset_button.py
+new file mode 100644
+index 0000000..80b89c4
+--- /dev/null
++++ b/setup/qrelia_network_reset_button.py
+@@ -0,0 +1,132 @@
++#!/usr/bin/env python3
++"""
++QRelia hardware network reset button watcher.
++
++Wiring:
++- GPIO26 / physical pin 37 -> one side of momentary button
++- GND / physical pin 39 -> other side of momentary button
++
++The script uses the Raspberry Pi internal pull-up resistor, so the button
++must short GPIO26 to ground when pressed.
++"""
++
++import os
++import subprocess
++import time
++from pathlib import Path
++
++from gpiozero import Button
++from display_state import read_display_state, set_display_state
++
++
++BUTTON_GPIO = int(os.environ.get("QRELIA_RESET_BUTTON_GPIO", "26"))
++HOLD_SECONDS = float(os.environ.get("QRELIA_RESET_BUTTON_HOLD_SECONDS", "7"))
++POLL_SECONDS = float(os.environ.get("QRELIA_RESET_BUTTON_POLL_SECONDS", "0.05"))
++BOUNCE_SECONDS = float(os.environ.get("QRELIA_RESET_BUTTON_BOUNCE_SECONDS", "0.08"))
++
++RESET_SCRIPT = Path(os.environ.get(
++    "QRELIA_HARD_RESET_SCRIPT",
++    "/home/qrelia/qrelia/setup/qrelia_hard_reset_network.sh"
++))
++
++
++def log(message):
++    print(f"[QRelia Reset Button] {message}", flush=True)
++
++
++def restore_display_state(previous_state):
++    if previous_state:
++        set_display_state(
++            previous_state.get("state", "boot"),
++            ssid=previous_state.get("ssid", ""),
++            message=previous_state.get("message", ""),
++            ip=previous_state.get("ip", ""),
++        )
++        return
++    set_display_state("boot", message="Reset cancelled")
++
++
++def run_hard_reset():
++    if not RESET_SCRIPT.exists():
++        log(f"Reset script not found: {RESET_SCRIPT}")
++        set_display_state("error", message="Reset script missing")
++        return
++
++    log("Long press confirmed. Running hard network reset.")
++    set_display_state("setup_starting", message="Reset all")
++
++    try:
++        subprocess.run(["/bin/bash", str(RESET_SCRIPT)], check=False)
++    except Exception as ex:
++        log(f"Hard reset failed: {ex}")
++        set_display_state("error", message="Reset failed")
++
++
++def wait_until_released(button):
++    while button.is_pressed:
++        time.sleep(POLL_SECONDS)
++
++
++def monitor_button():
++    button = Button(
++        BUTTON_GPIO,
++        pull_up=True,
++        bounce_time=BOUNCE_SECONDS,
++        hold_time=HOLD_SECONDS,
++        hold_repeat=False,
++    )
++
++    log(
++        f"Monitoring GPIO{BUTTON_GPIO}. "
++        f"Hold for {HOLD_SECONDS:.1f}s to reset venue Wi-Fi and QRelia pairing."
++    )
++
++    reset_in_progress = False
++
++    while True:
++        if reset_in_progress:
++            time.sleep(1)
++            continue
++
++        button.wait_for_press()
++        previous_display_state = read_display_state()
++        pressed_at = time.monotonic()
++        last_remaining = None
++
++        log("Button pressed. Waiting for long hold confirmation.")
++
++        while button.is_pressed:
++            elapsed = time.monotonic() - pressed_at
++            remaining = max(0, int(round(HOLD_SECONDS - elapsed)))
++
++            if remaining != last_remaining:
++                last_remaining = remaining
++                if remaining > 0:
++                    set_display_state(
++                        "reset_armed",
++                        message=f"Reset all {remaining}s",
++                        ip=""
++                    )
++                else:
++                    set_display_state(
++                        "setup_starting",
++                        message="Reset all",
++                        ip=""
++                    )
++
++            if elapsed >= HOLD_SECONDS:
++                reset_in_progress = True
++                run_hard_reset()
++                wait_until_released(button)
++                break
++
++            time.sleep(POLL_SECONDS)
++
++        if not reset_in_progress:
++            log("Button released before hold threshold. Reset cancelled. Restoring previous display state.")
++            restore_display_state(previous_display_state)
++            time.sleep(0.25)
++
++
++if __name__ == "__main__":
++    monitor_button()
+diff --git a/setup/qrelia_network_watchdog.py b/setup/qrelia_network_watchdog.py
+new file mode 100644
+index 0000000..688dc01
+--- /dev/null
++++ b/setup/qrelia_network_watchdog.py
+@@ -0,0 +1,477 @@
++#!/usr/bin/env python3
++
++import subprocess
++import time
++import json
++import os
++from pathlib import Path
++
++from display_state import set_display_state
++
++PROVISIONING_FAILURE_PATH = Path("/home/qrelia/qreliadevice/provisioning_error.json")
++SETUP_TRANSITION_PATH = Path(os.environ.get("QRELIA_SETUP_TRANSITION_PATH", "/tmp/qrelia-setup-transition.json"))
++WIFI_SETUP_PENDING_PATH = Path(os.environ.get("QRELIA_WIFI_SETUP_PENDING_PATH", "/home/qrelia/qreliadevice/wifi_setup_pending.json"))
++WIFI_SETUP_FAILURE_PATH = Path(os.environ.get("QRELIA_WIFI_SETUP_FAILURE_PATH", "/home/qrelia/qreliadevice/wifi_setup_error.json"))
++
++SETUP_SERVICE = "qrelia-setup-mode.service"
++TENANT_SERVICE = "qrelia-tenant.service"
++
++CHECK_INTERVAL_SECONDS = 5
++WARNING_AFTER_SECONDS = 10
++SETUP_TRANSITION_MAX_AGE_SECONDS = 180
++FRESH_SETUP_WIFI_TIMEOUT_SECONDS = int(os.environ.get("QRELIA_FRESH_SETUP_WIFI_TIMEOUT_SECONDS", "45"))
++
++WIFI_INTERFACE = "wlan0"
++
++
++def log(message):
++    print(f"[QRelia Network Watchdog] {message}", flush=True)
++
++
++def run(command, timeout=8):
++    try:
++        return subprocess.run(
++            command,
++            shell=True,
++            text=True,
++            capture_output=True,
++            timeout=timeout
++        )
++    except subprocess.TimeoutExpired:
++        log(f"Command timed out: {command}")
++        return subprocess.CompletedProcess(command, 124, "", "Timeout")
++    except Exception as ex:
++        log(f"Command failed: {command} | {ex}")
++        return subprocess.CompletedProcess(command, 1, "", str(ex))
++
++
++def get_ip_address():
++    result = run(f"ip -4 addr show {WIFI_INTERFACE}", timeout=3)
++
++    for line in result.stdout.splitlines():
++        line = line.strip()
++        if line.startswith("inet "):
++            return line.split()[1].split("/")[0]
++
++    return ""
++
++
++def get_connected_ssid():
++    result = run(f"iwgetid {WIFI_INTERFACE} -r", timeout=3)
++    ssid = result.stdout.strip()
++
++    if ssid:
++        return ssid
++
++    result = run("nmcli -t -f DEVICE,TYPE,STATE,CONNECTION dev", timeout=5)
++
++    for line in result.stdout.splitlines():
++        parts = line.split(":")
++        if len(parts) >= 4:
++            device = parts[0]
++            dev_type = parts[1]
++            state = parts[2]
++            connection = parts[3]
++
++            if device == WIFI_INTERFACE and dev_type == "wifi" and state == "connected":
++                return connection
++
++    return ""
++
++
++def get_active_connection_name():
++    result = run(f"nmcli -g GENERAL.CONNECTION device show {WIFI_INTERFACE}", timeout=5)
++    if result.returncode != 0:
++        return ""
++    value = result.stdout.strip()
++    return "" if value in {"", "--"} else value
++
++
++def read_json_file(path):
++    try:
++        if not path.exists():
++            return {}
++        data = json.loads(path.read_text(encoding="utf-8"))
++        return data if isinstance(data, dict) else {}
++    except Exception as exc:
++        log(f"Could not read {path}: {exc}")
++        return {}
++
++
++def write_json_atomic(path, payload, mode=0o600):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    temp_path = path.with_suffix(path.suffix + ".tmp")
++    temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
++    temp_path.replace(path)
++    try:
++        os.chmod(path, mode)
++    except Exception:
++        pass
++
++
++def read_wifi_setup_pending():
++    return read_json_file(WIFI_SETUP_PENDING_PATH)
++
++
++def clear_wifi_setup_pending():
++    try:
++        WIFI_SETUP_PENDING_PATH.unlink(missing_ok=True)
++    except Exception as exc:
++        log(f"Could not clear pending Wi-Fi setup marker: {exc}")
++
++
++def clear_wifi_setup_failure():
++    try:
++        WIFI_SETUP_FAILURE_PATH.unlink(missing_ok=True)
++    except Exception as exc:
++        log(f"Could not clear Wi-Fi setup failure marker: {exc}")
++
++
++def write_wifi_setup_failure(pending, message):
++    payload = {
++        "attemptId": str(pending.get("attemptId") or ""),
++        "ssid": str(pending.get("ssid") or "venue Wi-Fi"),
++        "connectionName": str(pending.get("connectionName") or "QRelia-Venue-WiFi"),
++        "message": str(message or "The saved Wi-Fi details could not connect."),
++        "createdAtUnix": time.time(),
++    }
++    try:
++        write_json_atomic(WIFI_SETUP_FAILURE_PATH, payload)
++    except Exception as exc:
++        log(f"Could not write Wi-Fi setup failure marker: {exc}")
++
++
++def pending_profile_connected(pending, ssid, ip, active_connection):
++    expected_connection = str(pending.get("connectionName") or "QRelia-Venue-WiFi")
++    return bool(ssid and ip and active_connection == expected_connection)
++
++
++def recover_failed_fresh_setup(pending):
++    expected_connection = str(pending.get("connectionName") or "QRelia-Venue-WiFi")
++    expected_ssid = str(pending.get("ssid") or "venue Wi-Fi")
++    log(f"Fresh setup could not connect to '{expected_ssid}'. Returning to setup mode.")
++
++    # Remove only the profile created by the captive portal. This makes the
++    # no-saved-profile rule and setup service agree instead of fighting each other.
++    run(f"nmcli connection delete {shell_quote(expected_connection)} || true", timeout=12)
++    write_wifi_setup_failure(
++        pending,
++        "The network could not be joined. Check the Wi-Fi name and password.",
++    )
++    clear_wifi_setup_pending()
++    set_display_state("setup_starting", ssid=expected_ssid, message="Wrong Wi-Fi - setup returning")
++
++    if not setup_mode_active():
++        start_setup_mode("Check Wi-Fi password")
++
++
++def shell_quote(value):
++    import shlex
++    return shlex.quote(str(value or ""))
++
++
++def get_saved_wifi_connections():
++    result = run("nmcli -t -f NAME,TYPE connection show", timeout=5)
++
++    saved = []
++
++    for line in result.stdout.splitlines():
++        parts = line.split(":")
++        if len(parts) >= 2:
++            name = parts[0]
++            conn_type = parts[1]
++
++            if conn_type in ("802-11-wireless", "wifi", "wireless"):
++                saved.append(name)
++
++    return saved
++
++
++def has_saved_wifi():
++    return len(get_saved_wifi_connections()) > 0
++
++
++def setup_mode_active():
++    result = run(f"systemctl is-active {SETUP_SERVICE}", timeout=5)
++    return result.stdout.strip() == "active"
++
++
++def read_pairing_failure():
++    try:
++        if not PROVISIONING_FAILURE_PATH.exists():
++            return {}
++
++        data = json.loads(PROVISIONING_FAILURE_PATH.read_text(encoding="utf-8"))
++        return data if isinstance(data, dict) else {}
++    except Exception as exc:
++        log(f"Could not read pairing failure marker: {exc}")
++        return {}
++
++
++def pairing_recovery_required():
++    data = read_pairing_failure()
++    return bool(data) and not bool(data.get("retryable"))
++
++
++def pairing_recovery_message():
++    data = read_pairing_failure()
++    message = str(data.get("message") or "").strip()
++    return message or "Fix setup code/PIN"
++
++
++def setup_transition_active():
++    """Protect the credential-save and scheduled-reboot hand-off."""
++    try:
++        if not SETUP_TRANSITION_PATH.exists():
++            return False
++
++        data = json.loads(SETUP_TRANSITION_PATH.read_text(encoding="utf-8"))
++        state = str(data.get("state") or "") if isinstance(data, dict) else ""
++        age = time.time() - SETUP_TRANSITION_PATH.stat().st_mtime
++        if age <= SETUP_TRANSITION_MAX_AGE_SECONDS:
++            return True
++
++        # If reboot scheduling ever fails unexpectedly, release the watchdog
++        # after the bounded grace period. Keep the saved profile: normal runtime
++        # will attempt it and the display will report any connection problem.
++        log(f"Removing stale setup transition marker in state '{state}' ({int(age)}s old).")
++        SETUP_TRANSITION_PATH.unlink(missing_ok=True)
++    except Exception as exc:
++        log(f"Could not inspect setup transition marker: {exc}")
++
++    return False
++
++def start_setup_mode(reason="Starting setup"):
++    log(f"Starting setup mode: {reason}")
++    set_display_state("setup_starting", message=reason[:24])
++
++    # LCD generation rule: qrelia-tenant is the ONLY owner of GPIO18 and the LCD.
++    # Setup mode changes wlan0 and serves the captive portal beside it; it never
++    # starts a second LED/display renderer and therefore must not stop tenant.
++    result = run(f"systemctl start {SETUP_SERVICE}", timeout=15)
++
++    if result.returncode != 0:
++        log(f"Failed to start setup mode: {result.stderr}")
++        set_display_state("error", message="Setup failed")
++
++
++def stop_setup_mode():
++    run(f"systemctl stop {SETUP_SERVICE} || true", timeout=15)
++
++
++def tenant_mode_active():
++    result = run(f"systemctl is-active {TENANT_SERVICE}", timeout=5)
++    return result.stdout.strip() == "active"
++
++
++def start_tenant_mode(reason="Starting tenant runtime"):
++    log(f"Starting tenant mode: {reason}")
++    run(f"systemctl reset-failed {TENANT_SERVICE} || true", timeout=5)
++    result = run(f"systemctl start {TENANT_SERVICE}", timeout=15)
++
++    if result.returncode != 0:
++        log(f"Failed to start tenant mode: {result.stderr}")
++        set_display_state("error", message="Tenant failed")
++
++
++def stop_tenant_mode():
++    run(f"systemctl stop {TENANT_SERVICE} || true", timeout=15)
++
++
++def nudge_wifi_reconnect():
++    # This must never block forever.
++    # It simply asks NetworkManager to try wlan0 again.
++    run(f"nmcli radio wifi on", timeout=5)
++    run(f"nmcli device connect {WIFI_INTERFACE}", timeout=10)
++
++
++def main():
++    log("Network watchdog started.")
++
++    disconnected_since = None
++    fresh_setup_disconnected_since = None
++    last_connected_ssid = ""
++    last_state = ""
++
++    while True:
++        ssid = get_connected_ssid()
++        ip = get_ip_address()
++        active_connection = get_active_connection_name()
++        pending_wifi_setup = read_wifi_setup_pending()
++        now = time.time()
++
++        # setup_server.py has saved the profile and scheduled reboot in an
++        # independent systemd unit. Do not stop setup mode before the browser has
++        # received its confirmation page and the reboot unit has fired.
++        if setup_transition_active():
++            if last_state != "setup_transition":
++                log("Setup save/reboot hand-off is active.")
++                last_state = "setup_transition"
++            time.sleep(CHECK_INTERVAL_SECONDS)
++            continue
++
++        # A profile created by the captive portal is provisional until that
++        # exact NetworkManager connection associates and receives an IPv4 address.
++        # This applies only to a fresh setup attempt; established devices still
++        # tolerate normal router outages without dropping into setup mode.
++        if pending_wifi_setup:
++            expected_ssid = str(pending_wifi_setup.get("ssid") or "venue Wi-Fi")
++
++            if pending_profile_connected(pending_wifi_setup, ssid, ip, active_connection):
++                log(f"Fresh Wi-Fi setup succeeded on '{expected_ssid}' ({ip}).")
++                clear_wifi_setup_pending()
++                clear_wifi_setup_failure()
++                fresh_setup_disconnected_since = None
++            else:
++                if fresh_setup_disconnected_since is None:
++                    fresh_setup_disconnected_since = now
++                    log(f"Testing fresh Wi-Fi setup for '{expected_ssid}'.")
++
++                pending_for = int(now - fresh_setup_disconnected_since)
++
++                # If the boot decider already started setup mode, finish recovery
++                # immediately so the watchdog cannot stop it because a bad saved
++                # profile still exists.
++                if setup_mode_active() or pending_for >= FRESH_SETUP_WIFI_TIMEOUT_SECONDS:
++                    recover_failed_fresh_setup(pending_wifi_setup)
++                    fresh_setup_disconnected_since = None
++                    disconnected_since = None
++                    last_state = "fresh_setup_recovery"
++                    time.sleep(CHECK_INTERVAL_SECONDS)
++                    continue
++
++                remaining = max(0, FRESH_SETUP_WIFI_TIMEOUT_SECONDS - pending_for)
++                state_key = f"fresh_setup_testing:{pending_for // CHECK_INTERVAL_SECONDS}:{expected_ssid}"
++                if state_key != last_state:
++                    set_display_state(
++                        "wifi_failed",
++                        ssid=expected_ssid,
++                        message=f"Checking WiFi {remaining}s",
++                        ip="",
++                    )
++                    last_state = state_key
++
++                if pending_for % 15 < CHECK_INTERVAL_SECONDS:
++                    expected_connection = str(pending_wifi_setup.get("connectionName") or "QRelia-Venue-WiFi")
++                    run(f"nmcli connection up {shell_quote(expected_connection)} ifname {WIFI_INTERFACE} || true", timeout=15)
++
++                time.sleep(CHECK_INTERVAL_SECONDS)
++                continue
++        else:
++            fresh_setup_disconnected_since = None
++
++        if ssid:
++            if disconnected_since is not None:
++                log(f"Wi-Fi recovered: {ssid}")
++
++            disconnected_since = None
++            last_connected_ssid = ssid
++
++            if pairing_recovery_required():
++                if not setup_mode_active():
++                    start_setup_mode("Fix pairing")
++                set_display_state("setup_ready", message=pairing_recovery_message(), ip="192.168.4.1")
++                last_state = "pairing_recovery_connected"
++                time.sleep(CHECK_INTERVAL_SECONDS)
++                continue
++
++            if setup_mode_active():
++                log("Wi-Fi connected while setup mode is active. Stopping setup mode.")
++                stop_setup_mode()
++
++            # Cold boot/power-cycle recovery: Wi-Fi being connected is not enough.
++            # The tenant runtime owns heartbeat + SignalR + order/profile handling,
++            # so make sure it is running whenever venue Wi-Fi is available.
++            if not tenant_mode_active():
++                start_tenant_mode("venue Wi-Fi connected")
++
++            state_key = f"normal:{ssid}:{ip}"
++
++            if state_key != last_state:
++                set_display_state("normal_mode", ssid=ssid, ip=ip)
++                last_state = state_key
++
++            time.sleep(CHECK_INTERVAL_SECONDS)
++            continue
++
++        # No Wi-Fi currently connected.
++        if disconnected_since is None:
++            disconnected_since = now
++            log("Wi-Fi connection lost or unavailable at boot.")
++
++        offline_for = int(now - disconnected_since)
++        saved_wifi_profiles = get_saved_wifi_connections()
++
++        # Only confirmed code/PIN failures should return to setup mode.
++        # Retryable cloud/DNS failures must stay in normal Wi-Fi mode and keep retrying.
++        if pairing_recovery_required():
++            log("Confirmed pairing failure marker exists; keeping setup mode available.")
++
++            if not setup_mode_active():
++                start_setup_mode("Fix setup code")
++
++            set_display_state("setup_ready", message=pairing_recovery_message(), ip="192.168.4.1")
++            last_state = "setup_pairing_recovery"
++            time.sleep(CHECK_INTERVAL_SECONDS)
++            continue
++
++        # If there are no saved Wi-Fi profiles, setup mode is correct.
++        if not saved_wifi_profiles:
++            log("No saved Wi-Fi profiles found.")
++
++            if not setup_mode_active():
++                start_setup_mode("Starting setup")
++
++            last_state = "setup_no_saved_wifi"
++            time.sleep(CHECK_INTERVAL_SECONDS)
++            continue
++
++        # If saved Wi-Fi exists, do NOT enter setup mode.
++        # Keep retrying forever, because the hotspot/router may come back.
++        if setup_mode_active():
++            log("Saved Wi-Fi exists but setup mode is active. Stopping setup mode.")
++            stop_setup_mode()
++
++        if offline_for >= WARNING_AFTER_SECONDS:
++            profile_text = saved_wifi_profiles[0]
++            message = f"Offline {offline_for}s"
++
++            state_key = f"wifi_failed:{offline_for // CHECK_INTERVAL_SECONDS}:{profile_text}"
++
++            log(
++                f"Wi-Fi unavailable for {offline_for}s. "
++                f"Saved profiles exist: {saved_wifi_profiles}. Retrying."
++            )
++
++            set_display_state(
++                "wifi_failed",
++                ssid=last_connected_ssid or profile_text,
++                message=message,
++                ip=""
++            )
++
++            # Every few loops, nudge NetworkManager to try again.
++            if offline_for % 20 < CHECK_INTERVAL_SECONDS:
++                nudge_wifi_reconnect()
++
++            last_state = state_key
++
++        else:
++            # Early boot grace period.
++            message = "Checking WiFi"
++            state_key = f"checking:{offline_for}"
++
++            if state_key != last_state:
++                set_display_state(
++                    "wifi_failed",
++                    ssid=last_connected_ssid,
++                    message=message,
++                    ip=""
++                )
++                last_state = state_key
++
++        time.sleep(CHECK_INTERVAL_SECONDS)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/setup/qrelia_setup_mode.py b/setup/qrelia_setup_mode.py
+new file mode 100755
+index 0000000..2161d9c
+--- /dev/null
++++ b/setup/qrelia_setup_mode.py
+@@ -0,0 +1,238 @@
++#!/usr/bin/env python3
++"""QRelia LCD-generation captive setup mode.
++
++The tenant runtime deliberately stays alive while setup mode owns wlan0. It is
++therefore the single owner of the 480x320 LCD and GPIO18 WS281x strip. This
++process owns networking + captive portal only.
++"""
++import json
++import os
++import signal
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++from display_state import set_display_state
++try:
++    from wifi_scan import refresh_wifi_network_cache, WIFI_SCAN_CACHE_PATH
++except Exception as wifi_scan_import_error:
++    refresh_wifi_network_cache = None
++    WIFI_SCAN_CACHE_PATH = None
++    print(f"Wi-Fi scan helper unavailable: {wifi_scan_import_error}", flush=True)
++
++SCRIPT_DIR = Path(__file__).resolve().parent
++SETUP_SERVER = Path(os.environ.get("QRELIA_SETUP_SERVER", str(SCRIPT_DIR / "setup_server.py")))
++PROVISIONING_FAILURE_PATH = Path(os.environ.get("QRELIA_PROVISIONING_FAILURE_PATH", "/home/qrelia/qreliadevice/provisioning_error.json"))
++WIFI_SETUP_FAILURE_PATH = Path(os.environ.get("QRELIA_WIFI_SETUP_FAILURE_PATH", "/home/qrelia/qreliadevice/wifi_setup_error.json"))
++WIFI_INTERFACE = os.environ.get("QRELIA_WIFI_INTERFACE", "wlan0").strip() or "wlan0"
++SETUP_IP = os.environ.get("QRELIA_SETUP_IP", "192.168.4.1").strip() or "192.168.4.1"
++SETUP_HOSTNAME = os.environ.get("QRELIA_SETUP_HOSTNAME", "qrelia.local").strip() or "qrelia.local"
++SETUP_URL = os.environ.get("QRELIA_SETUP_URL", f"http://{SETUP_HOSTNAME}/").strip() or f"http://{SETUP_HOSTNAME}/"
++SETUP_SSID = os.environ.get("QRELIA_SETUP_SSID", "QRelia-Setup").strip() or "QRelia-Setup"
++SETUP_PASSWORD = os.environ.get("QRELIA_SETUP_PASSWORD", "qrelia1234").strip() or "qrelia1234"
++DNSMASQ_CONFIG_PATH = Path(os.environ.get("QRELIA_SETUP_DNSMASQ_CONFIG", "/tmp/qrelia-setup-dnsmasq.conf"))
++DNSMASQ_PID_PATH = Path(os.environ.get("QRELIA_SETUP_DNSMASQ_PID", "/run/qrelia-setup-dnsmasq.pid"))
++HOSTAPD_CONFIG_PATH = Path(os.environ.get("QRELIA_SETUP_HOSTAPD_CONFIG", "/tmp/qrelia-setup-hostapd.conf"))
++HOSTAPD_PID_PATH = Path(os.environ.get("QRELIA_SETUP_HOSTAPD_PID", "/run/qrelia-setup-hostapd.pid"))
++
++
++def run(args, check=False, timeout=20):
++    if isinstance(args, str):
++        printable = args
++        result = subprocess.run(args, shell=True, text=True, capture_output=False, timeout=timeout)
++    else:
++        printable = " ".join(str(x) for x in args)
++        result = subprocess.run([str(x) for x in args], text=True, capture_output=False, timeout=timeout)
++    print(f"> {printable}", flush=True)
++    if check and result.returncode != 0:
++        raise RuntimeError(f"Command failed ({result.returncode}): {printable}")
++    return result
++
++
++def terminate_pid_file(path, name):
++    try:
++        if path.exists():
++            pid = path.read_text(encoding="utf-8").strip()
++            if pid:
++                subprocess.run(["kill", pid], check=False, timeout=5)
++            path.unlink(missing_ok=True)
++    except Exception as exc:
++        print(f"Could not stop {name}: {exc}", flush=True)
++
++
++def cache_nearby_wifi_networks():
++    if refresh_wifi_network_cache is None:
++        return
++    print("Scanning nearby venue Wi-Fi before starting QRelia-Setup AP...", flush=True)
++    try:
++        networks, source, error = refresh_wifi_network_cache(
++            allow_iw_fallback=False,
++            preserve_existing_on_empty=False,
++        )
++        cache_path = str(WIFI_SCAN_CACHE_PATH) if WIFI_SCAN_CACHE_PATH else "cache"
++        if networks:
++            print(f"Cached {len(networks)} Wi-Fi network(s) from {source} at {cache_path}.", flush=True)
++        elif error:
++            print(f"No Wi-Fi networks cached: {error}", flush=True)
++    except Exception as exc:
++        print(f"Nearby Wi-Fi pre-scan failed: {exc}", flush=True)
++
++
++def write_dnsmasq_config():
++    DNSMASQ_CONFIG_PATH.write_text(
++        f"""# QRelia setup captive portal DNS/DHCP. Generated at runtime.
++interface={WIFI_INTERFACE}
++bind-interfaces
++port=53
++dhcp-authoritative
++dhcp-range=192.168.4.10,192.168.4.80,255.255.255.0,12h
++dhcp-option=option:router,{SETUP_IP}
++dhcp-option=option:dns-server,{SETUP_IP}
++dhcp-option=114,{SETUP_URL}
++domain-needed
++bogus-priv
++local-ttl=60
++address=/{SETUP_HOSTNAME}/{SETUP_IP}
++address=/#/{SETUP_IP}
++""",
++        encoding="utf-8",
++    )
++
++
++def write_hostapd_config():
++    # WPA2 is intentionally used for maximum compatibility with phones during
++    # commissioning. The setup network exists only while the device is being set up.
++    HOSTAPD_CONFIG_PATH.write_text(
++        f"""interface={WIFI_INTERFACE}
++driver=nl80211
++ssid={SETUP_SSID}
++hw_mode=g
++channel=6
++wmm_enabled=1
++auth_algs=1
++ignore_broadcast_ssid=0
++wpa=2
++wpa_passphrase={SETUP_PASSWORD}
++wpa_key_mgmt=WPA-PSK
++rsn_pairwise=CCMP
++""",
++        encoding="utf-8",
++    )
++
++
++def stop_setup_daemons():
++    terminate_pid_file(HOSTAPD_PID_PATH, "QRelia hostapd")
++    terminate_pid_file(DNSMASQ_PID_PATH, "QRelia dnsmasq")
++    # Stop distro-level instances as a conflict guard. They remain disabled by
++    # install_device.sh; these calls are harmless when the services are absent.
++    subprocess.run(["systemctl", "stop", "hostapd"], check=False, timeout=10)
++    subprocess.run(["systemctl", "stop", "dnsmasq"], check=False, timeout=10)
++
++
++def start_setup_daemons():
++    write_dnsmasq_config()
++    write_hostapd_config()
++    run(["dnsmasq", f"--conf-file={DNSMASQ_CONFIG_PATH}", f"--pid-file={DNSMASQ_PID_PATH}"], check=True)
++    run(["hostapd", "-B", "-P", str(HOSTAPD_PID_PATH), str(HOSTAPD_CONFIG_PATH)], check=True)
++
++
++def pairing_failure_message():
++    try:
++        if not PROVISIONING_FAILURE_PATH.exists():
++            return ""
++        data = json.loads(PROVISIONING_FAILURE_PATH.read_text(encoding="utf-8"))
++        if not isinstance(data, dict) or bool(data.get("retryable")):
++            return ""
++        return str(data.get("message") or "Fix setup code/PIN").strip()
++    except Exception:
++        return "Fix setup code/PIN"
++
++
++def wifi_setup_failure_message():
++    try:
++        if not WIFI_SETUP_FAILURE_PATH.exists():
++            return ""
++        data = json.loads(WIFI_SETUP_FAILURE_PATH.read_text(encoding="utf-8"))
++        if not isinstance(data, dict):
++            return ""
++        ssid = str(data.get("ssid") or "venue Wi-Fi").strip()
++        return f"Check password: {ssid}"
++    except Exception:
++        return "Check Wi-Fi password"
++
++
++def setup_recovery_message():
++    return wifi_setup_failure_message() or pairing_failure_message()
++
++
++def start_setup_network():
++    recovery_message = setup_recovery_message()
++    set_display_state("setup_starting", message=recovery_message or "Preparing QRelia-Setup")
++    stop_setup_daemons()
++
++    # Scan while wlan0 is still a normal managed station; single-radio Raspberry
++    # Pi hardware cannot reliably scan once the AP is broadcasting.
++    run(["nmcli", "dev", "set", WIFI_INTERFACE, "managed", "yes"])
++    run(["nmcli", "radio", "wifi", "on"])
++    cache_nearby_wifi_networks()
++
++    run(["nmcli", "dev", "disconnect", WIFI_INTERFACE])
++    run(["nmcli", "dev", "set", WIFI_INTERFACE, "managed", "no"])
++    time.sleep(0.8)
++
++    run(["ip", "link", "set", WIFI_INTERFACE, "down"])
++    run(["ip", "addr", "flush", "dev", WIFI_INTERFACE])
++    run(["ip", "addr", "add", f"{SETUP_IP}/24", "dev", WIFI_INTERFACE], check=True)
++    run(["ip", "link", "set", WIFI_INTERFACE, "up"], check=True)
++    time.sleep(1.0)
++
++    start_setup_daemons()
++    time.sleep(0.7)
++    set_display_state("setup_ready", message=recovery_message or "Connect to QRelia-Setup", ip=SETUP_IP)
++    print(f"QRelia setup network active: SSID={SETUP_SSID}, portal={SETUP_URL} ({SETUP_IP})", flush=True)
++
++
++def stop_setup_network():
++    print("Stopping QRelia setup network...", flush=True)
++    stop_setup_daemons()
++    subprocess.run(["ip", "addr", "flush", "dev", WIFI_INTERFACE], check=False, timeout=8)
++    subprocess.run(["nmcli", "dev", "set", WIFI_INTERFACE, "managed", "yes"], check=False, timeout=8)
++    subprocess.run(["nmcli", "radio", "wifi", "on"], check=False, timeout=8)
++
++
++def main():
++    # IMPORTANT: do not stop qrelia-tenant.service. It is the sole owner of both
++    # the LCD and GPIO18 strip in the LCD-generation device.
++    set_display_state("setup_starting", message=setup_recovery_message() or "Preparing setup")
++    server = None
++
++    def handle_exit(signum, frame):
++        raise SystemExit(0)
++
++    signal.signal(signal.SIGTERM, handle_exit)
++    signal.signal(signal.SIGINT, handle_exit)
++
++    try:
++        start_setup_network()
++        print("Starting QRelia setup web server...", flush=True)
++        server = subprocess.Popen(
++            [sys.executable, str(SETUP_SERVER)],
++            cwd=str(SCRIPT_DIR),
++            stdout=sys.stdout,
++            stderr=sys.stderr,
++            env={**os.environ, "PYTHONUNBUFFERED": "1"},
++        )
++        server.wait()
++    finally:
++        if server is not None and server.poll() is None:
++            server.terminate()
++            try:
++                server.wait(timeout=5)
++            except subprocess.TimeoutExpired:
++                server.kill()
++        stop_setup_network()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/setup/setup_server.py b/setup/setup_server.py
+new file mode 100644
+index 0000000..fd0a1d6
+--- /dev/null
++++ b/setup/setup_server.py
+@@ -0,0 +1,1371 @@
++#!/usr/bin/env python3
++
++from flask import Flask, request, render_template_string, redirect, Response
++import subprocess
++import html
++import shlex
++import shutil
++import os
++import time
++import json
++import re
++from pathlib import Path
++from display_state import set_display_state as write_display_state
++from wifi_scan import get_wifi_networks
++
++app = Flask(__name__)
++
++DEVICE_CONFIG_PATH = Path(os.environ.get("QRELIA_DEVICE_CONFIG_PATH", "/home/qrelia/qreliadevice/qrelia_device_config.json"))
++PROVISIONING_PATH = Path(os.environ.get("QRELIA_PROVISIONING_PATH", "/home/qrelia/qreliadevice/provisioning.json"))
++PROVISIONING_FAILURE_PATH = Path(os.environ.get("QRELIA_PROVISIONING_FAILURE_PATH", "/home/qrelia/qreliadevice/provisioning_error.json"))
++SETUP_TRANSITION_PATH = Path(os.environ.get("QRELIA_SETUP_TRANSITION_PATH", "/tmp/qrelia-setup-transition.json"))
++WIFI_SETUP_PENDING_PATH = Path(os.environ.get("QRELIA_WIFI_SETUP_PENDING_PATH", "/home/qrelia/qreliadevice/wifi_setup_pending.json"))
++WIFI_SETUP_FAILURE_PATH = Path(os.environ.get("QRELIA_WIFI_SETUP_FAILURE_PATH", "/home/qrelia/qreliadevice/wifi_setup_error.json"))
++WIFI_CONNECTION_NAME = os.environ.get("QRELIA_WIFI_CONNECTION_NAME", "QRelia-Venue-WiFi")
++DEFAULT_ADMIN_BASE_URL = os.environ.get("QRELIA_ADMIN_BASE_URL", "https://admin.qrelia.uk").rstrip("/")
++SETUP_HOSTNAME = os.environ.get("QRELIA_SETUP_HOSTNAME", "qrelia.local").strip().lower()
++SETUP_IP = os.environ.get("QRELIA_SETUP_IP", "192.168.4.1").strip()
++SETUP_URL = os.environ.get("QRELIA_SETUP_URL", f"http://{SETUP_HOSTNAME}/").strip()
++KNOWN_SETUP_HOSTS = {SETUP_HOSTNAME, SETUP_IP, "localhost", "127.0.0.1"}
++CAPTIVE_PORTAL_PATHS = {
++    "/generate_204",
++    "/gen_204",
++    "/hotspot-detect.html",
++    "/library/test/success.html",
++    "/connecttest.txt",
++    "/ncsi.txt",
++    "/canonical.html",
++    "/success.txt",
++    "/redirect",
++}
++
++
++def mark_setup_transition(ssid, state="saving_wifi"):
++    SETUP_TRANSITION_PATH.parent.mkdir(parents=True, exist_ok=True)
++    payload = {
++        "state": str(state or "saving_wifi"),
++        "ssid": str(ssid or ""),
++        "pid": os.getpid(),
++        "createdAtUnix": time.time(),
++    }
++    SETUP_TRANSITION_PATH.write_text(json.dumps(payload), encoding="utf-8")
++
++
++def clear_setup_transition():
++    try:
++        SETUP_TRANSITION_PATH.unlink(missing_ok=True)
++    except Exception:
++        pass
++
++
++def read_setup_transition():
++    try:
++        if not SETUP_TRANSITION_PATH.exists():
++            return {}
++        data = json.loads(SETUP_TRANSITION_PATH.read_text(encoding="utf-8"))
++        return data if isinstance(data, dict) else {}
++    except Exception as exc:
++        print(f"Could not read setup transition marker: {exc}", flush=True)
++        return {}
++
++
++def reboot_handoff_transition():
++    transition = read_setup_transition()
++    if str(transition.get("state") or "") != "reboot_scheduled":
++        return {}
++    return transition
++
++
++def set_display_state(state, ssid="", message="", ip="192.168.4.1"):
++    """Write display state without allowing portal probes to erase reboot status.
++
++    Mobile captive-portal clients continue issuing GET probes after /save. Those
++    requests used to replace the explicit reboot screen with phone_connected or
++    wifi_form before the display renderer could display it. Once reboot is scheduled,
++    only the rebooting state may replace the latched display payload.
++    """
++    transition = reboot_handoff_transition()
++    if transition and state != "rebooting":
++        print(
++            f"Preserving reboot display state; ignored late state '{state}'.",
++            flush=True,
++        )
++        return
++    write_display_state(state, ssid=ssid, message=message, ip=ip)
++
++
++def latch_reboot_display(ssid):
++    write_display_state(
++        "rebooting",
++        ssid=str(ssid or ""),
++        message="Setup saved - restarting",
++        ip="",
++    )
++
++
++def write_json_atomic(path, payload, mode=0o600):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    temp_path = path.with_suffix(path.suffix + ".tmp")
++    temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
++    temp_path.replace(path)
++    try:
++        os.chmod(path, mode)
++    except Exception:
++        pass
++
++
++def write_wifi_setup_pending(ssid, connection_name):
++    payload = {
++        "attemptId": f"{int(time.time() * 1000)}-{os.getpid()}",
++        "ssid": str(ssid or ""),
++        "connectionName": str(connection_name or WIFI_CONNECTION_NAME),
++        "createdAtUnix": time.time(),
++    }
++    write_json_atomic(WIFI_SETUP_PENDING_PATH, payload)
++
++
++def clear_wifi_setup_pending():
++    try:
++        WIFI_SETUP_PENDING_PATH.unlink(missing_ok=True)
++    except Exception as exc:
++        print(f"Could not clear pending Wi-Fi setup marker: {exc}", flush=True)
++
++
++def clear_wifi_setup_failure():
++    try:
++        WIFI_SETUP_FAILURE_PATH.unlink(missing_ok=True)
++    except Exception as exc:
++        print(f"Could not clear Wi-Fi setup failure marker: {exc}", flush=True)
++
++
++def wifi_setup_failure():
++    data = read_json(WIFI_SETUP_FAILURE_PATH)
++    return data if isinstance(data, dict) else {}
++
++
++def wifi_setup_error_message():
++    data = wifi_setup_failure()
++    if not data:
++        return ""
++    ssid = str(data.get("ssid") or "the selected network").strip()
++    detail = str(data.get("message") or "The device could not connect using the saved Wi-Fi details.").strip()
++    return f"Wi-Fi setup failed for {ssid}: {detail} Enter the Wi-Fi password again."
++
++
++def schedule_reboot(delay_seconds=8):
++    """Schedule reboot outside qrelia-setup-mode.service.
++
++    The setup service is stopped as part of reboot. A normal background child of
++    the Flask process would be killed with that service before it could reboot
++    the Pi, so use an independent transient systemd unit.
++    """
++    systemd_run = shutil.which("systemd-run")
++    systemctl = shutil.which("systemctl") or "/usr/bin/systemctl"
++
++    if not systemd_run:
++        return False, "systemd-run is not available"
++
++    unit_name = f"qrelia-setup-reboot-{os.getpid()}-{int(time.time())}"
++    try:
++        result = subprocess.run(
++            [
++                systemd_run,
++                "--quiet",
++                "--collect",
++                f"--unit={unit_name}",
++                f"--on-active={max(1, int(delay_seconds))}s",
++                systemctl,
++                "reboot",
++            ],
++            text=True,
++            capture_output=True,
++            timeout=12,
++        )
++    except Exception as exc:
++        return False, f"Could not schedule reboot: {exc}"
++
++    if result.returncode == 0:
++        return True, ""
++
++    return False, (result.stderr or result.stdout or "systemd-run failed").strip()
++
++
++SETUP_SAVED_PAGE = """
++<!doctype html>
++<html>
++<head>
++    <title>QRelia Setup Saved</title>
++    <meta name="viewport" content="width=device-width, initial-scale=1">
++    <style>
++        :root {
++            --text:#fff; --muted:rgba(255,255,255,.70); --accent:#7dd3fc;
++            --good:#4ade80; --panel:rgba(255,255,255,.08);
++        }
++        * { box-sizing:border-box; }
++        body {
++            margin:0; min-height:100vh; padding:20px; display:grid; place-items:center;
++            font-family:Arial,sans-serif; color:var(--text);
++            background:
++                radial-gradient(circle at 20% 0%, rgba(125,211,252,.24), transparent 34%),
++                radial-gradient(circle at 80% 20%, rgba(168,85,247,.20), transparent 31%),
++                linear-gradient(135deg,#050814,#0b1020 55%,#020617);
++        }
++        .card {
++            width:100%; max-width:640px; padding:32px; border-radius:28px;
++            background:var(--panel); border:1px solid rgba(255,255,255,.16);
++            box-shadow:0 24px 90px rgba(0,0,0,.52),0 0 60px rgba(74,222,128,.10);
++            backdrop-filter:blur(18px); text-align:center;
++        }
++        .orb {
++            width:92px; height:92px; margin:0 auto 22px; border-radius:999px; position:relative;
++            background:radial-gradient(circle, #fff 0 8%, #86efac 9% 24%, #22c55e 25% 46%, rgba(34,197,94,.14) 47% 100%);
++            box-shadow:0 0 0 1px rgba(34,197,94,.45),0 0 58px rgba(34,197,94,.40);
++            animation:success-pop .55s ease-out both, breathe 2.2s ease-in-out .55s infinite;
++        }
++        .orb:after {
++            content:""; position:absolute; inset:-10px; border-radius:inherit;
++            border:2px solid rgba(74,222,128,.40); border-top-color:transparent;
++            animation:spin 2.2s linear infinite;
++        }
++        .tick {
++            position:absolute; left:29px; top:30px; width:35px; height:19px;
++            border-left:6px solid white; border-bottom:6px solid white;
++            transform:rotate(-45deg);
++        }
++        .eyebrow { color:var(--accent); font-size:12px; font-weight:900; letter-spacing:.16em; text-transform:uppercase; }
++        h1 { margin:10px 0 10px; font-size:31px; }
++        p { margin:0 auto 16px; max-width:530px; color:var(--muted); line-height:1.55; }
++        .network {
++            display:inline-block; margin:4px 0 20px; padding:9px 14px; border-radius:999px;
++            background:rgba(125,211,252,.10); border:1px solid rgba(125,211,252,.24); font-weight:800;
++        }
++        .display-panel {
++            margin-top:20px; padding:18px; border-radius:20px; text-align:left;
++            background:rgba(0,0,0,.22); border:1px solid rgba(255,255,255,.10);
++        }
++        .display-panel > strong { display:block; margin-bottom:12px; font-size:16px; }
++        .display-row { display:grid; grid-template-columns:110px 1fr; gap:12px; padding:10px 0; border-top:1px solid rgba(255,255,255,.08); }
++        .display-row:first-of-type { border-top:0; padding-top:2px; }
++        .display-label { color:#fff; font-weight:900; letter-spacing:.04em; }
++        .display-copy { color:var(--muted); font-size:14px; line-height:1.45; }
++        .recovery {
++            margin-top:16px; padding:14px 16px; border-radius:16px;
++            background:rgba(125,211,252,.08); border:1px solid rgba(125,211,252,.18);
++            color:rgba(255,255,255,.76); font-size:13px; line-height:1.5; text-align:left;
++        }
++        .hint { margin-top:16px; color:rgba(255,255,255,.52); font-size:12px; line-height:1.45; }
++        @keyframes spin { to { transform:rotate(360deg); } }
++        @keyframes breathe { 50% { transform:scale(1.05); filter:brightness(1.10); } }
++        @keyframes success-pop { 0% { transform:scale(.78); opacity:.4; } 70% { transform:scale(1.10); } 100% { transform:scale(1); opacity:1; } }
++        @media (max-width:520px) {
++            body { padding:12px; align-items:flex-start; }
++            .card { padding:24px 18px; border-radius:22px; }
++            .display-row { grid-template-columns:1fr; gap:3px; }
++        }
++    </style>
++</head>
++<body>
++    <main class="card">
++        <div class="orb"><span class="tick"></span></div>
++        <div class="eyebrow">QRelia secure setup</div>
++        <h1>Setup saved — device restarting</h1>
++        <div class="network">{{ ssid }}</div>
++        <p>Your Wi-Fi and QRelia pairing details have been stored. QRelia will now restart and connect in normal operating mode.</p>
++
++        <div class="display-panel">
++            <strong>Check the device LCD after restart</strong>
++            <div class="display-row">
++                <span class="display-label">ONLINE</span>
++                <span class="display-copy">The device is connected and ready.</span>
++            </div>
++            <div class="display-row">
++                <span class="display-label">CONNECTING</span>
++                <span class="display-copy">The device is still joining the venue network. Give it a moment.</span>
++            </div>
++            <div class="display-row">
++                <span class="display-label">WIFI ISSUE / ERROR</span>
++                <span class="display-copy">Read the LCD message — it will show the connection or pairing problem.</span>
++            </div>
++        </div>
++
++        <div class="recovery"><strong>Wrong Wi-Fi details?</strong> QRelia will test the saved network after restart. If it cannot connect, it automatically removes the failed profile and brings QRelia-Setup back so the password can be corrected.</div>
++        <div class="hint">QRelia-Setup will disappear during restart. If the venue Wi-Fi fails, wait for QRelia-Setup to return and reconnect to it.</div>
++    </main>
++</body>
++</html>
++"""
++
++PAGE = """
++<!doctype html>
++<html>
++<head>
++    <title>QRelia Device Setup</title>
++    <meta name="viewport" content="width=device-width, initial-scale=1">
++
++    <style>
++        :root {
++            --bg:#050814;
++            --panel:rgba(255,255,255,0.08);
++            --line:rgba(255,255,255,0.16);
++            --line-strong:rgba(125,211,252,0.36);
++            --text:#fff;
++            --muted:rgba(255,255,255,0.68);
++            --soft:rgba(255,255,255,0.50);
++            --accent:#7dd3fc;
++            --accent-2:#38bdf8;
++            --good:#22c55e;
++            --danger:#ef4444;
++            --warn:#f59e0b;
++        }
++        * { box-sizing: border-box; }
++        html { scroll-behavior:smooth; }
++        body {
++            margin:0;
++            min-height:100vh;
++            font-family:Arial,sans-serif;
++            background:
++                radial-gradient(circle at 20% 0%, rgba(125,211,252,.22), transparent 34%),
++                radial-gradient(circle at 80% 20%, rgba(168,85,247,.18), transparent 30%),
++                linear-gradient(135deg,#050814,#0b1020 55%,#020617);
++            color:var(--text);
++            display:flex;
++            align-items:center;
++            justify-content:center;
++            padding:18px;
++        }
++        .card {
++            width:100%;
++            max-width:620px;
++            padding:24px;
++            border-radius:26px;
++            background:var(--panel);
++            border:1px solid var(--line);
++            box-shadow:0 24px 90px rgba(0,0,0,.50);
++            backdrop-filter:blur(18px);
++        }
++        .eyebrow {
++            color:var(--accent);
++            text-transform:uppercase;
++            letter-spacing:.16em;
++            font-size:12px;
++            font-weight:800;
++            margin-bottom:10px;
++        }
++        h1 { margin:0 0 8px; font-size:30px; line-height:1.08; }
++        p { color:var(--muted); line-height:1.5; margin:0 0 18px; font-size:15px; }
++        .steps { display:grid; gap:10px; margin:18px 0; }
++        .step {
++            display:grid;
++            grid-template-columns:32px minmax(0,1fr);
++            gap:10px;
++            padding:12px;
++            border-radius:16px;
++            background:rgba(0,0,0,.20);
++            border:1px solid rgba(255,255,255,.10);
++        }
++        .num {
++            width:32px;
++            height:32px;
++            display:grid;
++            place-items:center;
++            border-radius:999px;
++            background:linear-gradient(135deg,#7dd3fc,#38bdf8);
++            color:#04111f;
++            font-weight:900;
++        }
++        .step strong { display:block; margin-bottom:2px; }
++        label {
++            display:block;
++            margin:0 0 8px;
++            color:rgba(255,255,255,.86);
++            font-size:14px;
++            font-weight:800;
++        }
++        input {
++            width:100%;
++            border:1px solid var(--line);
++            background:rgba(0,0,0,.24);
++            color:white;
++            border-radius:14px;
++            padding:14px 15px;
++            font-size:16px;
++            outline:none;
++            margin-bottom:16px;
++            transition:border-color .2s ease, box-shadow .2s ease, transform .2s ease;
++        }
++        input:focus {
++            border-color:rgba(125,211,252,.75);
++            box-shadow:0 0 0 4px rgba(125,211,252,.12);
++        }
++        .wifi-head {
++            display:flex;
++            align-items:center;
++            justify-content:space-between;
++            gap:12px;
++            margin-bottom:10px;
++        }
++        .wifi-head label { margin-bottom:0; }
++        .refresh-link {
++            color:var(--accent);
++            text-decoration:none;
++            font-size:13px;
++            font-weight:900;
++            white-space:nowrap;
++            padding:8px 12px;
++            border-radius:999px;
++            border:1px solid rgba(125,211,252,.22);
++            background:rgba(125,211,252,.08);
++            transition:transform .18s ease, background .18s ease, border-color .18s ease;
++        }
++        .refresh-link:hover {
++            text-decoration:none;
++            transform:translateY(-1px);
++            background:rgba(125,211,252,.14);
++            border-color:rgba(125,211,252,.38);
++        }
++        .section-caption {
++            margin:-2px 0 14px;
++            color:var(--soft);
++            font-size:13px;
++            line-height:1.45;
++        }
++        .wifi-picker {
++            margin-bottom:14px;
++            border:1px solid rgba(255,255,255,.10);
++            background:rgba(0,0,0,.16);
++            border-radius:20px;
++            overflow:hidden;
++        }
++        .wifi-picker-head {
++            display:flex;
++            align-items:center;
++            justify-content:space-between;
++            gap:12px;
++            padding:14px 16px 10px;
++            border-bottom:1px solid rgba(255,255,255,.08);
++            background:linear-gradient(180deg, rgba(125,211,252,.06), rgba(125,211,252,0));
++        }
++        .wifi-picker-head strong { display:block; font-size:14px; }
++        .wifi-picker-head span { display:block; color:var(--soft); font-size:12px; margin-top:2px; }
++        .selected-chip {
++            max-width:52%;
++            padding:8px 12px;
++            border-radius:999px;
++            background:rgba(125,211,252,.12);
++            border:1px solid rgba(125,211,252,.24);
++            color:#d8f3ff;
++            font-size:12px;
++            font-weight:800;
++            white-space:nowrap;
++            overflow:hidden;
++            text-overflow:ellipsis;
++        }
++        .wifi-grid {
++            display:grid;
++            gap:10px;
++            padding:14px;
++            max-height:360px;
++            overflow:auto;
++        }
++        .wifi-grid::-webkit-scrollbar { width:10px; }
++        .wifi-grid::-webkit-scrollbar-thumb {
++            background:rgba(255,255,255,.12);
++            border-radius:999px;
++            border:2px solid transparent;
++            background-clip:padding-box;
++        }
++        .wifi-card {
++            position:relative;
++            display:block;
++            width:100%;
++            text-align:left;
++            border:1px solid rgba(255,255,255,.10);
++            background:
++                linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02)),
++                rgba(10,17,32,.55);
++            color:var(--text);
++            border-radius:18px;
++            padding:14px 16px;
++            cursor:pointer;
++            transition:transform .20s ease, border-color .20s ease, box-shadow .20s ease, background .20s ease;
++            opacity:0;
++            transform:translateY(8px);
++            animation:cardIn .35s ease forwards;
++        }
++        .wifi-card:hover {
++            transform:translateY(-2px);
++            border-color:rgba(125,211,252,.28);
++            box-shadow:0 14px 28px rgba(0,0,0,.24);
++        }
++        .wifi-card.selected {
++            border-color:var(--line-strong);
++            background:
++                radial-gradient(circle at top right, rgba(56,189,248,.18), transparent 42%),
++                linear-gradient(180deg, rgba(125,211,252,.10), rgba(255,255,255,.04)),
++                rgba(10,17,32,.72);
++            box-shadow:0 0 0 1px rgba(125,211,252,.18), 0 18px 35px rgba(0,0,0,.28);
++            transform:translateY(-1px);
++        }
++        .wifi-card.selected::after {
++            content:"";
++            position:absolute;
++            inset:-1px;
++            border-radius:18px;
++            padding:1px;
++            background:linear-gradient(135deg, rgba(125,211,252,.95), rgba(56,189,248,.25));
++            -webkit-mask:linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
++            -webkit-mask-composite:xor;
++                    mask-composite:exclude;
++            pointer-events:none;
++        }
++        .wifi-card.manual {
++            border-style:dashed;
++            background:linear-gradient(180deg, rgba(125,211,252,.06), rgba(255,255,255,.03));
++        }
++        .wifi-card-top {
++            display:flex;
++            align-items:flex-start;
++            justify-content:space-between;
++            gap:12px;
++        }
++        .wifi-name {
++            display:flex;
++            align-items:center;
++            gap:10px;
++            min-width:0;
++        }
++        .wifi-icon {
++            width:42px;
++            height:42px;
++            border-radius:14px;
++            display:grid;
++            place-items:center;
++            background:rgba(125,211,252,.10);
++            border:1px solid rgba(125,211,252,.16);
++            color:#d8f3ff;
++            font-size:18px;
++            flex:0 0 auto;
++        }
++        .wifi-name-text {
++            min-width:0;
++        }
++        .wifi-name-text strong {
++            display:block;
++            font-size:15px;
++            line-height:1.2;
++            overflow:hidden;
++            text-overflow:ellipsis;
++            white-space:nowrap;
++        }
++        .wifi-name-text span {
++            display:block;
++            margin-top:3px;
++            font-size:12px;
++            color:var(--soft);
++        }
++        .wifi-badges {
++            display:flex;
++            flex-wrap:wrap;
++            justify-content:flex-end;
++            gap:6px;
++        }
++        .badge {
++            display:inline-flex;
++            align-items:center;
++            gap:5px;
++            padding:6px 9px;
++            border-radius:999px;
++            font-size:11px;
++            font-weight:800;
++            background:rgba(255,255,255,.06);
++            border:1px solid rgba(255,255,255,.08);
++            color:#e5f6ff;
++        }
++        .badge.recommended {
++            color:#07253a;
++            background:linear-gradient(135deg, #7dd3fc, #38bdf8);
++            border-color:transparent;
++        }
++        .wifi-meta {
++            display:flex;
++            align-items:center;
++            justify-content:space-between;
++            gap:10px;
++            margin-top:12px;
++            color:var(--soft);
++            font-size:12px;
++        }
++        .signal-wrap {
++            display:flex;
++            align-items:center;
++            gap:8px;
++            color:#dceef9;
++            font-weight:800;
++        }
++        .signal-bars {
++            display:flex;
++            align-items:flex-end;
++            gap:3px;
++            height:16px;
++        }
++        .signal-bars span {
++            width:4px;
++            border-radius:999px;
++            background:rgba(255,255,255,.20);
++            transition:background .18s ease, transform .18s ease;
++        }
++        .signal-bars span:nth-child(1) { height:5px; }
++        .signal-bars span:nth-child(2) { height:8px; }
++        .signal-bars span:nth-child(3) { height:11px; }
++        .signal-bars span:nth-child(4) { height:14px; }
++        .signal-bars.level-1 span:nth-child(-n+1),
++        .signal-bars.level-2 span:nth-child(-n+2),
++        .signal-bars.level-3 span:nth-child(-n+3),
++        .signal-bars.level-4 span:nth-child(-n+4) {
++            background:linear-gradient(180deg, #7dd3fc, #38bdf8);
++        }
++        .wifi-empty-state {
++            padding:14px 16px 2px;
++        }
++        .manual-ssid {
++            display:none;
++            padding:0 0 2px;
++            animation:fadeUp .22s ease;
++        }
++        .manual-ssid.show { display:block; }
++        .pairing {
++            margin-top:18px;
++            padding:18px;
++            border-radius:20px;
++            border:1px solid rgba(125,211,252,.22);
++            background:rgba(125,211,252,.08);
++        }
++        .pairing h2 { margin:0 0 7px; font-size:18px; }
++        .advanced { margin-top:8px; }
++        .advanced summary { cursor:pointer; color:var(--accent); font-weight:800; margin-bottom:10px; }
++        button[type="submit"] {
++            width:100%;
++            border:0;
++            border-radius:16px;
++            padding:15px 16px;
++            font-size:16px;
++            font-weight:900;
++            color:#02111f;
++            background:linear-gradient(135deg,#7dd3fc,#38bdf8);
++            cursor:pointer;
++            margin-top:4px;
++            transition:transform .18s ease, box-shadow .18s ease;
++            box-shadow:0 16px 30px rgba(56,189,248,.22);
++        }
++        button[type="submit"]:hover {
++            transform:translateY(-1px);
++            box-shadow:0 20px 35px rgba(56,189,248,.26);
++        }
++        .notice {
++            margin:0 0 16px;
++            padding:14px;
++            border-radius:14px;
++            font-size:14px;
++            line-height:1.45;
++        }
++        .notice.good { background:rgba(34,197,94,.14); border:1px solid rgba(34,197,94,.35); color:#bbf7d0; }
++        .notice.bad { background:rgba(239,68,68,.14); border:1px solid rgba(239,68,68,.35); color:#fecaca; }
++        .notice.warn { background:rgba(245,158,11,.14); border:1px solid rgba(245,158,11,.35); color:#fde68a; }
++        .hint { margin-top:16px; color:rgba(255,255,255,.50); font-size:12px; line-height:1.45; }
++
++        @keyframes cardIn {
++            from { opacity:0; transform:translateY(8px); }
++            to { opacity:1; transform:translateY(0); }
++        }
++        @keyframes fadeUp {
++            from { opacity:0; transform:translateY(6px); }
++            to { opacity:1; transform:translateY(0); }
++        }
++
++        @media (max-width: 640px) {
++            body { padding:12px; align-items:flex-start; }
++            .card { padding:18px; border-radius:22px; }
++            h1 { font-size:28px; }
++            .wifi-picker-head,
++            .wifi-head {
++                flex-direction:column;
++                align-items:flex-start;
++            }
++            .selected-chip { max-width:100%; }
++            .wifi-card-top,
++            .wifi-meta {
++                flex-direction:column;
++                align-items:flex-start;
++            }
++            .wifi-badges { justify-content:flex-start; }
++        }
++    </style>
++</head>
++
++<body>
++    <main class="card">
++        <div class="eyebrow">QRelia Ambient Device</div>
++        <h1>Setup takes 3 steps</h1>
++        <p>Keep this page open until the device confirms the details were saved. After restart, check the LCD for the final connection status.</p>
++
++        {% if pairing_error %}
++            <div class="notice bad"><strong>Pairing failed:</strong> {{ pairing_error }}<br>Re-enter the setup code and PIN from the admin page below.</div>
++        {% endif %}
++
++        {% if message %}
++            <div class="notice {{ message_type }}">{{ message }}</div>
++        {% endif %}
++
++        <div class="steps">
++            <div class="step"><span class="num">1</span><span><strong>Venue Wi-Fi</strong> Choose the Wi-Fi this device should use every day, then enter its password.</span></div>
++            <div class="step"><span class="num">2</span><span><strong>QRelia pairing</strong> Copy the setup code and PIN from the device order page.</span></div>
++            <div class="step"><span class="num">3</span><span><strong>Restart and automatic recovery</strong> The LCD confirms the restart. If the saved Wi-Fi cannot connect, QRelia-Setup returns automatically so the details can be corrected.</span></div>
++        </div>
++
++        <form method="post" action="/save">
++            <div class="wifi-head">
++                <label for="selected_ssid">1. Choose venue Wi-Fi</label>
++                <a class="refresh-link" href="/?refresh=1">Refresh list</a>
++            </div>
++            <div class="section-caption">Tap a nearby network card below. If the venue Wi-Fi is hidden, choose the hidden network card and type the name manually.</div>
++
++            {% if wifi_networks %}
++                <input type="hidden" id="selected_ssid" name="selected_ssid" value="{{ selected_ssid_value }}">
++
++                <div class="wifi-picker">
++                    <div class="wifi-picker-head">
++                        <div>
++                            <strong>Nearby Wi-Fi networks</strong>
++                            <span>
++                                Found {{ wifi_networks|length }} nearby network{% if wifi_networks|length != 1 %}s{% endif %}.
++                                {% if wifi_scan_meta and wifi_scan_meta.isStale %}Showing the last saved scan because a live refresh was not available.{% else %}Choose the venue network from the list below.{% endif %}
++                            </span>
++                        </div>
++                        <div id="selectedChip" class="selected-chip">No Wi-Fi selected yet</div>
++                    </div>
++
++                    <div class="wifi-grid" id="wifiGrid">
++                        {% for network in wifi_networks %}
++                            {% set signal_value = network.signal|int %}
++                            {% set signal_level = 1 if signal_value < 26 else 2 if signal_value < 51 else 3 if signal_value < 76 else 4 %}
++                            <button
++                                type="button"
++                                class="wifi-card{% if selected_ssid_value == network.ssid %} selected{% endif %}"
++                                data-ssid="{{ network.ssid }}"
++                                data-label="{{ network.ssid|e }}"
++                                style="animation-delay: {{ '%.2f'|format(loop.index0 * 0.03) }}s;"
++                            >
++                                <div class="wifi-card-top">
++                                    <div class="wifi-name">
++                                        <div class="wifi-icon">📶</div>
++                                        <div class="wifi-name-text">
++                                            <strong>{{ network.ssid }}</strong>
++                                            <span>{{ network.security }}</span>
++                                        </div>
++                                    </div>
++                                    <div class="wifi-badges">
++                                        {% if loop.first %}<span class="badge recommended">Best signal</span>{% endif %}
++                                        <span class="badge">{{ network.security }}</span>
++                                    </div>
++                                </div>
++                                <div class="wifi-meta">
++                                    <div class="signal-wrap">
++                                        <div class="signal-bars level-{{ signal_level }}"><span></span><span></span><span></span><span></span></div>
++                                        <span>{{ network.signal }}% signal</span>
++                                    </div>
++                                    <span>{% if signal_value >= 70 %}Strong connection{% elif signal_value >= 45 %}Good connection{% elif signal_value >= 25 %}Okay connection{% else %}Weak connection{% endif %}</span>
++                                </div>
++                            </button>
++                        {% endfor %}
++
++                        <button
++                            type="button"
++                            class="wifi-card manual{% if selected_ssid_value == '__manual__' or (manual_ssid_value and not selected_ssid_value) %} selected{% endif %}"
++                            data-ssid="__manual__"
++                            data-label="Hidden or other Wi-Fi"
++                            style="animation-delay: {{ '%.2f'|format(wifi_networks|length * 0.03) }}s;"
++                        >
++                            <div class="wifi-card-top">
++                                <div class="wifi-name">
++                                    <div class="wifi-icon">✏️</div>
++                                    <div class="wifi-name-text">
++                                        <strong>Hidden or other Wi-Fi</strong>
++                                        <span>Use this if the venue network is not visible in the scan.</span>
++                                    </div>
++                                </div>
++                                <div class="wifi-badges">
++                                    <span class="badge">Manual entry</span>
++                                </div>
++                            </div>
++                            <div class="wifi-meta">
++                                <span>Type the Wi-Fi name yourself</span>
++                                <span>For hidden SSIDs</span>
++                            </div>
++                        </button>
++                    </div>
++                </div>
++
++                <div id="manualSsidWrap" class="manual-ssid{% if selected_ssid_value == '__manual__' or (manual_ssid_value and not selected_ssid_value) %} show{% endif %}">
++                    <label for="manual_ssid">Hidden / other Wi-Fi name</label>
++                    <input id="manual_ssid" name="manual_ssid" placeholder="Hidden or unlisted Wi-Fi name" autocomplete="off" value="{{ manual_ssid_value }}">
++                </div>
++            {% else %}
++                <div class="wifi-picker">
++                    <div class="wifi-empty-state">
++                        <input id="manual_ssid" name="manual_ssid" placeholder="Venue Wi-Fi name" required autocomplete="off" value="{{ manual_ssid_value }}">
++                        <div class="section-caption">No nearby Wi-Fi list is available yet. Enter the network name manually, or tap Refresh list.</div>
++                    </div>
++                </div>
++            {% endif %}
++
++            {% if wifi_scan_error %}
++                <div class="notice warn">Could not fully refresh the Wi-Fi list, so QRelia is using the best available scan. You can still choose a network or use Hidden or other Wi-Fi.</div>
++            {% endif %}
++
++            <label for="password">Wi-Fi password</label>
++            <input id="password" name="password" type="password" placeholder="Wi-Fi password" required autocomplete="off">
++
++            <div class="pairing">
++                <h2>2. QRelia pairing details</h2>
++                {% if is_provisioned and not pairing_error %}
++                    <p>This device is already paired. Leave code and PIN blank only when you are changing Wi-Fi for the same venue.</p>
++                {% elif pairing_saved and not pairing_error %}
++                    <p>Pairing details are already stored from the previous attempt. Leave these fields blank while correcting the Wi-Fi password.</p>
++                {% else %}
++                    <p>Required before this device can go live. Invalid values are rejected by QRelia and the device will stay in setup.</p>
++                {% endif %}
++
++                <label for="setup_code">Exact setup code</label>
++                <input id="setup_code" name="setup_code" placeholder="QR-A1B2C3-000123-01" autocomplete="off" autocapitalize="characters" value="{{ setup_code_value }}" {% if pairing_required %}required{% endif %}>
++
++                <label for="setup_pin">Exact 6-digit PIN</label>
++                <input id="setup_pin" name="setup_pin" placeholder="123456" inputmode="numeric" pattern="[0-9]{6}" autocomplete="off" value="{{ setup_pin_value }}" {% if pairing_required %}required{% endif %}>
++
++                <details class="advanced">
++                    <summary>Advanced QRelia URL</summary>
++                    <label for="admin_base_url">QRelia admin URL</label>
++                    <input id="admin_base_url" name="admin_base_url" value="{{ admin_base_url }}" autocomplete="off">
++                </details>
++            </div>
++
++            <button type="submit">Save setup and restart device</button>
++        </form>
++
++        <div class="hint">
++            Setup should open automatically after joining QRelia-Setup.<br>
++            Manual address: qrelia.local / 192.168.4.1<br>
++            Setup network: QRelia-Setup<br>
++            Pairing file: {{ provisioning_path }}
++        </div>
++    </main>
++
++    <script>
++        (function () {
++            var hiddenSelectedInput = document.getElementById('selected_ssid');
++            var manualWrap = document.getElementById('manualSsidWrap');
++            var manualInput = document.getElementById('manual_ssid');
++            var selectedChip = document.getElementById('selectedChip');
++            var wifiCards = Array.prototype.slice.call(document.querySelectorAll('.wifi-card[data-ssid]'));
++
++            function updateSelectedChip() {
++                if (!selectedChip || !hiddenSelectedInput) return;
++                if (!hiddenSelectedInput.value) {
++                    selectedChip.textContent = 'No Wi-Fi selected yet';
++                    return;
++                }
++                if (hiddenSelectedInput.value === '__manual__') {
++                    selectedChip.textContent = manualInput && manualInput.value
++                        ? 'Selected: ' + manualInput.value
++                        : 'Selected: Hidden or other Wi-Fi';
++                    return;
++                }
++                var selected = wifiCards.find(function (card) {
++                    return card.getAttribute('data-ssid') === hiddenSelectedInput.value;
++                });
++                selectedChip.textContent = 'Selected: ' + (selected ? selected.getAttribute('data-label') : hiddenSelectedInput.value);
++            }
++
++            function syncManualSsid() {
++                if (!hiddenSelectedInput || !manualWrap || !manualInput) {
++                    updateSelectedChip();
++                    return;
++                }
++                var showManual = hiddenSelectedInput.value === '__manual__';
++                manualWrap.classList.toggle('show', showManual);
++                manualInput.required = showManual;
++                if (!showManual) {
++                    manualInput.value = '';
++                }
++                updateSelectedChip();
++            }
++
++            function setSelectedCard(value) {
++                if (!hiddenSelectedInput) return;
++                hiddenSelectedInput.value = value;
++                wifiCards.forEach(function (card) {
++                    var isSelected = card.getAttribute('data-ssid') === value;
++                    card.classList.toggle('selected', isSelected);
++                    card.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
++                });
++                syncManualSsid();
++                if (value === '__manual__' && manualInput) {
++                    setTimeout(function () { manualInput.focus(); }, 80);
++                }
++            }
++
++            wifiCards.forEach(function (card) {
++                card.addEventListener('click', function () {
++                    setSelectedCard(card.getAttribute('data-ssid'));
++                });
++            });
++
++            if (manualInput) {
++                manualInput.addEventListener('input', updateSelectedChip);
++            }
++
++            syncManualSsid();
++        })();
++    </script>
++</body>
++</html>
++"""
++
++
++def host_without_port():
++    return (request.host or "").split(":", 1)[0].strip().lower()
++
++
++def is_captive_portal_probe(path):
++    path = (path or "/").split("?", 1)[0].rstrip("/") or "/"
++    lower_path = path.lower()
++
++    if lower_path in CAPTIVE_PORTAL_PATHS:
++        return True
++
++    return lower_path.startswith((
++        "/generate_204",
++        "/gen_204",
++        "/hotspot-detect",
++        "/connecttest",
++        "/ncsi",
++        "/canonical",
++    ))
++
++
++def captive_redirect_response():
++    # 302 is deliberate: Android, iOS, Windows and Linux network managers treat
++    # this as a captive portal instead of a normal internet connection.
++    response = redirect(SETUP_URL, code=302)
++    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
++    response.headers["Pragma"] = "no-cache"
++    return response
++
++
++@app.before_request
++def handle_captive_portal_detection():
++    if request.method != "GET":
++        return None
++
++    path = request.path or "/"
++    host = host_without_port()
++    reboot_transition = reboot_handoff_transition()
++
++    if reboot_transition:
++        # Captive portal operating systems keep probing while the confirmation
++        # page is visible. Re-latch the display on every late GET so neither a probe
++        # nor a browser refresh can replace SETUP SAVED / RESTARTING.
++        latch_reboot_display(reboot_transition.get("ssid"))
++
++        if is_captive_portal_probe(path) or (host and host not in KNOWN_SETUP_HOSTS):
++            return captive_redirect_response()
++        return None
++
++    if is_captive_portal_probe(path):
++        set_display_state("phone_connected", message="Setup opened", ip=SETUP_IP)
++        return captive_redirect_response()
++
++    if host and host not in KNOWN_SETUP_HOSTS:
++        # dnsmasq resolves every HTTP hostname to the setup device while the
++        # owner is connected to QRelia-Setup. Redirect those requests to the
++        # friendly local setup hostname so the screen always lands on QRelia.
++        set_display_state("phone_connected", message="Setup opened", ip=SETUP_IP)
++        return captive_redirect_response()
++
++    return None
++
++
++def normalise_base_url(value):
++    value = (value or DEFAULT_ADMIN_BASE_URL).strip().rstrip("/")
++    if not value:
++        value = DEFAULT_ADMIN_BASE_URL
++    if not value.startswith(("http://", "https://")):
++        value = "https://" + value
++    return value.rstrip("/")
++
++
++def read_json(path):
++    try:
++        if path.exists():
++            return json.loads(path.read_text(encoding="utf-8"))
++    except Exception as exc:
++        print(f"Could not read {path}: {exc}", flush=True)
++    return {}
++
++
++def is_device_provisioned():
++    config = read_json(DEVICE_CONFIG_PATH)
++    return bool(str(config.get("tenantId") or "").strip() and str(config.get("deviceId") or "").strip())
++
++
++def has_pending_provisioning_request():
++    request_data = read_json(PROVISIONING_PATH)
++    return valid_setup_code(normalise_setup_code(request_data.get("setupCode"))) and valid_setup_pin(str(request_data.get("setupPin") or ""))
++
++
++def pairing_error_message():
++    data = read_json(PROVISIONING_FAILURE_PATH)
++    if bool(data.get("retryable")):
++        return ""
++    return str(data.get("message") or "").strip()
++
++
++def normalise_setup_code(setup_code):
++    return re.sub(r"\s+", "", (setup_code or "").strip().upper())
++
++
++def valid_setup_code(setup_code):
++    return bool(re.fullmatch(r"QR-[A-Z0-9]{6}-[0-9]{6}-[0-9]{2}", setup_code or ""))
++
++
++def valid_setup_pin(setup_pin):
++    return bool(re.fullmatch(r"[0-9]{6}", setup_pin or ""))
++
++
++def clear_pairing_error():
++    try:
++        if PROVISIONING_FAILURE_PATH.exists():
++            PROVISIONING_FAILURE_PATH.unlink()
++    except Exception as exc:
++        print(f"Could not remove pairing error marker: {exc}", flush=True)
++
++
++def write_provisioning_request(setup_code, setup_pin, admin_base_url):
++    payload = {
++        "setupCode": normalise_setup_code(setup_code),
++        "setupPin": setup_pin.strip(),
++        "adminBaseUrl": normalise_base_url(admin_base_url),
++        "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
++    }
++
++    PROVISIONING_PATH.parent.mkdir(parents=True, exist_ok=True)
++    PROVISIONING_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
++    try:
++        os.chmod(PROVISIONING_PATH, 0o600)
++    except Exception:
++        pass
++
++
++def render_setup_page(
++    message=None,
++    message_type=None,
++    refresh_networks=False,
++    selected_ssid_value="",
++    manual_ssid_value="",
++    setup_code_value="",
++    setup_pin_value="",
++    admin_base_url_value=None,
++):
++    is_provisioned = is_device_provisioned()
++    pairing_saved = has_pending_provisioning_request()
++    pairing_error = pairing_error_message()
++    wifi_error = wifi_setup_error_message()
++    if message is None and wifi_error:
++        message = wifi_error
++        message_type = "bad"
++    wifi_networks, wifi_scan_meta, wifi_scan_error = get_wifi_networks(force_refresh=refresh_networks)
++
++    return render_template_string(
++        PAGE,
++        message=message,
++        message_type=message_type,
++        is_provisioned=is_provisioned,
++        pairing_saved=pairing_saved,
++        pairing_required=((not is_provisioned) and (not pairing_saved)) or bool(pairing_error),
++        pairing_error=pairing_error,
++        admin_base_url=admin_base_url_value or DEFAULT_ADMIN_BASE_URL,
++        provisioning_path=str(PROVISIONING_PATH),
++        wifi_networks=wifi_networks,
++        wifi_scan_meta=wifi_scan_meta,
++        wifi_scan_error=wifi_scan_error,
++        selected_ssid_value=selected_ssid_value,
++        manual_ssid_value=manual_ssid_value,
++        setup_code_value=setup_code_value,
++        setup_pin_value=setup_pin_value,
++    )
++
++
++def run(command):
++    return subprocess.run(
++        command,
++        shell=True,
++        text=True,
++        capture_output=True
++    )
++
++
++def safe_shell(value):
++    return shlex.quote(value)
++
++
++@app.route("/generate_204", methods=["GET"])
++@app.route("/gen_204", methods=["GET"])
++@app.route("/hotspot-detect.html", methods=["GET"])
++@app.route("/library/test/success.html", methods=["GET"])
++@app.route("/connecttest.txt", methods=["GET"])
++@app.route("/ncsi.txt", methods=["GET"])
++@app.route("/canonical.html", methods=["GET"])
++@app.route("/success.txt", methods=["GET"])
++def captive_portal_probe():
++    return captive_redirect_response()
++
++
++@app.route("/favicon.ico", methods=["GET"])
++def favicon():
++    return Response(status=204)
++
++
++@app.route("/", methods=["GET"])
++def index():
++    reboot_transition = reboot_handoff_transition()
++    if reboot_transition:
++        ssid = str(reboot_transition.get("ssid") or "Venue Wi-Fi")
++        latch_reboot_display(ssid)
++        return render_template_string(SETUP_SAVED_PAGE, ssid=ssid)
++
++    set_display_state("wifi_form")
++    return render_setup_page(refresh_networks=request.args.get("refresh") == "1")
++
++@app.route("/save", methods=["POST"])
++def save():
++    selected_ssid = request.form.get("selected_ssid", "").strip()
++    manual_ssid = request.form.get("manual_ssid", "").strip()
++    legacy_ssid = request.form.get("ssid", "").strip()
++    ssid = manual_ssid if selected_ssid == "__manual__" else (selected_ssid or legacy_ssid or manual_ssid)
++    password = request.form.get("password", "").strip()
++    setup_code = request.form.get("setup_code", "").strip()
++    setup_pin = request.form.get("setup_pin", "").strip()
++    admin_base_url = request.form.get("admin_base_url", DEFAULT_ADMIN_BASE_URL).strip()
++    provisioned = is_device_provisioned()
++    set_display_state("saving_wifi", ssid=ssid)
++
++    if not ssid:
++        set_display_state("error", message="Missing Wi-Fi name")
++        return render_setup_page(
++            "Please choose a Wi-Fi network or select Hidden or other Wi-Fi.",
++            "bad",
++            selected_ssid_value=selected_ssid,
++            manual_ssid_value=manual_ssid,
++            setup_code_value=setup_code,
++            setup_pin_value=setup_pin,
++            admin_base_url_value=admin_base_url,
++        )
++
++    if len(password) < 8:
++        set_display_state("error", message="Password too short")
++        return render_setup_page(
++            "Wi-Fi password must be at least 8 characters.",
++            "bad",
++            selected_ssid_value=selected_ssid,
++            manual_ssid_value=manual_ssid,
++            setup_code_value=setup_code,
++            setup_pin_value=setup_pin,
++            admin_base_url_value=admin_base_url,
++        )
++
++    pairing_required = ((not provisioned) and (not has_pending_provisioning_request())) or bool(pairing_error_message())
++    setup_code = normalise_setup_code(setup_code)
++
++    if (pairing_required or setup_code or setup_pin) and (not setup_code or not setup_pin):
++        set_display_state("error", message="Missing setup PIN")
++        return render_setup_page(
++            "Setup code and PIN are required before this device can pair with QRelia.",
++            "bad",
++            selected_ssid_value=selected_ssid,
++            manual_ssid_value=manual_ssid,
++            setup_code_value=setup_code,
++            setup_pin_value=setup_pin,
++            admin_base_url_value=admin_base_url,
++        )
++
++    if setup_code and not valid_setup_code(setup_code):
++        set_display_state("error", message="Bad setup code")
++        return render_setup_page(
++            "Setup code format is not valid. Use the exact code from QRelia admin, for example QR-A1B2C3-000123-01.",
++            "bad",
++            selected_ssid_value=selected_ssid,
++            manual_ssid_value=manual_ssid,
++            setup_code_value=setup_code,
++            setup_pin_value=setup_pin,
++            admin_base_url_value=admin_base_url,
++        )
++
++    if setup_pin and not valid_setup_pin(setup_pin):
++        set_display_state("error", message="Invalid setup PIN")
++        return render_setup_page(
++            "Setup PIN must be exactly 6 digits.",
++            "bad",
++            selected_ssid_value=selected_ssid,
++            manual_ssid_value=manual_ssid,
++            setup_code_value=setup_code,
++            setup_pin_value=setup_pin,
++            admin_base_url_value=admin_base_url,
++        )
++
++    if setup_code and setup_pin:
++        try:
++            write_provisioning_request(setup_code, setup_pin, admin_base_url)
++            clear_pairing_error()
++        except Exception as exc:
++            set_display_state("error", message="Pairing save failed")
++            return render_setup_page(
++                "Could not save QRelia pairing details: " + html.escape(str(exc)),
++                "bad",
++                selected_ssid_value=selected_ssid,
++                manual_ssid_value=manual_ssid,
++                setup_code_value=setup_code,
++                setup_pin_value=setup_pin,
++                admin_base_url_value=admin_base_url,
++            )
++
++    connection_name = WIFI_CONNECTION_NAME
++    clear_wifi_setup_failure()
++
++    escaped_ssid = safe_shell(ssid)
++    escaped_password = safe_shell(password)
++    escaped_connection_name = safe_shell(connection_name)
++
++    # From this point onward a saved Wi-Fi profile may become visible to the
++    # watchdog at any instant.  Protect the entire save/reboot transaction, not
++    # just the final three-second reboot delay.
++    mark_setup_transition(ssid, state="saving_wifi")
++
++    # Remove previous QRelia Wi-Fi profile if it exists.
++    run(f"nmcli connection delete {escaped_connection_name} || true")
++
++    # Create new Wi-Fi profile.
++    create_result = run(
++        f"nmcli connection add "
++        f"type wifi "
++        f"ifname wlan0 "
++        f"con-name {escaped_connection_name} "
++        f"ssid {escaped_ssid}"
++    )
++
++    if create_result.returncode != 0:
++        run(f"nmcli connection delete {escaped_connection_name} || true")
++        clear_setup_transition()
++        set_display_state("wifi_failed", ssid=ssid, message="Profile failed")
++        return render_setup_page(
++            "Could not create Wi-Fi profile: " + html.escape(create_result.stderr),
++            "bad",
++            selected_ssid_value=selected_ssid,
++            manual_ssid_value=manual_ssid,
++            setup_code_value=setup_code,
++            setup_pin_value=setup_pin,
++            admin_base_url_value=admin_base_url,
++        )
++
++    # Add WPA password.
++    password_result = run(
++        f"nmcli connection modify {escaped_connection_name} "
++        f"wifi-sec.key-mgmt wpa-psk "
++        f"wifi-sec.psk {escaped_password} "
++        f"connection.autoconnect yes "
++        f"connection.autoconnect-priority 100"
++    )
++
++    if password_result.returncode != 0:
++        run(f"nmcli connection delete {escaped_connection_name} || true")
++        clear_setup_transition()
++        set_display_state("wifi_failed", ssid=ssid, message="Password failed")
++        return render_setup_page(
++            "Could not save Wi-Fi password: " + html.escape(password_result.stderr),
++            "bad",
++            selected_ssid_value=selected_ssid,
++            manual_ssid_value=manual_ssid,
++            setup_code_value=setup_code,
++            setup_pin_value=setup_pin,
++            admin_base_url_value=admin_base_url,
++        )
++
++    if selected_ssid == "__manual__":
++        run(f"nmcli connection modify {escaped_connection_name} 802-11-wireless.hidden yes")
++
++    # Keep router DNS, but add public fallback resolvers so admin.qrelia.uk can resolve
++    # even on networks that hand out weak/empty DNS settings during first boot.
++    run(
++        f"nmcli connection modify {escaped_connection_name} "
++        f"ipv4.dns '1.1.1.1 8.8.8.8' "
++        f"ipv4.ignore-auto-dns no"
++    )
++
++    # Persist a first-connection marker across reboot. The watchdog clears it
++    # only after this exact NetworkManager profile connects and receives an IP.
++    # If that never happens, the failed profile is removed and setup mode returns.
++    try:
++        write_wifi_setup_pending(ssid, connection_name)
++    except Exception as exc:
++        run(f"nmcli connection delete {escaped_connection_name} || true")
++        clear_setup_transition()
++        set_display_state("error", ssid=ssid, message="Setup marker failed")
++        return render_setup_page(
++            "Could not prepare the first Wi-Fi connection check: " + html.escape(str(exc)),
++            "bad",
++            selected_ssid_value=selected_ssid,
++            manual_ssid_value=manual_ssid,
++            setup_code_value=setup_code,
++            setup_pin_value=setup_pin,
++            admin_base_url_value=admin_base_url,
++        )
++
++    # Protect the hand-off first, then schedule reboot. The explicit display state
++    # is written only after systemd confirms that the reboot timer exists. This
++    # gives the renderer the full delay window and prevents any portal probe from
++    # replacing the screen before shutdown.
++    mark_setup_transition(ssid, state="reboot_scheduled")
++    reboot_scheduled, reboot_error = schedule_reboot(delay_seconds=12)
++
++    if not reboot_scheduled:
++        clear_setup_transition()
++        set_display_state("error", ssid=ssid, message="Restart device")
++        return render_setup_page(
++            "The setup details were saved, but automatic restart could not be scheduled. "
++            "Please restart the device manually. Technical detail: " + html.escape(reboot_error),
++            "bad",
++            selected_ssid_value=selected_ssid,
++            manual_ssid_value=manual_ssid,
++            setup_code_value=setup_code,
++            setup_pin_value=setup_pin,
++            admin_base_url_value=admin_base_url,
++        )
++
++    latch_reboot_display(ssid)
++    try:
++        os.sync()
++    except Exception:
++        pass
++
++    # Let the 60 FPS display renderer consume at least several frames before the
++    # response is returned. The state remains latched for the rest of the
++    # 12-second reboot window regardless of browser/captive-portal requests.
++    time.sleep(0.75)
++    return render_template_string(SETUP_SAVED_PAGE, ssid=ssid)
++
++
++@app.route("/<path:unused_path>", methods=["GET"])
++def setup_catchall(unused_path):
++    return captive_redirect_response()
++
++
++if __name__ == "__main__":
++    app.run(host="0.0.0.0", port=80)
+diff --git a/setup/wifi_scan.py b/setup/wifi_scan.py
+new file mode 100644
+index 0000000..d584164
+--- /dev/null
++++ b/setup/wifi_scan.py
+@@ -0,0 +1,346 @@
++#!/usr/bin/env python3
++"""Best-effort Wi-Fi scanning helpers for QRelia setup mode.
++
++The device normally uses the same wlan0 radio for venue Wi-Fi and for the
++QRelia-Setup access point. Live scanning while hostapd is broadcasting can be
++unreliable on Raspberry Pi Wi-Fi hardware, so setup mode caches a scan before
++switching wlan0 into AP mode. The Flask setup page can then show that cached
++list and still offer a best-effort refresh.
++"""
++
++import json
++import os
++import re
++import subprocess
++import time
++from pathlib import Path
++
++WIFI_INTERFACE = os.environ.get("QRELIA_WIFI_INTERFACE", "wlan0").strip() or "wlan0"
++WIFI_SCAN_CACHE_PATH = Path(os.environ.get("QRELIA_WIFI_SCAN_CACHE_PATH", "/tmp/qrelia_wifi_scan.json"))
++WIFI_SCAN_LAST_GOOD_PATH = Path(os.environ.get("QRELIA_WIFI_SCAN_LAST_GOOD_PATH", "/tmp/qrelia_wifi_scan_last_good.json"))
++WIFI_SCAN_MAX_AGE_SECONDS = int(os.environ.get("QRELIA_WIFI_SCAN_MAX_AGE_SECONDS", "1800"))
++
++
++def _now_utc_iso():
++    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
++
++
++def _run(args, timeout=14):
++    return subprocess.run(
++        args,
++        text=True,
++        capture_output=True,
++        timeout=timeout,
++        check=False,
++    )
++
++
++def _split_nmcli_escaped(line):
++    fields = []
++    current = []
++    escaped = False
++
++    for char in line.rstrip("\n"):
++        if escaped:
++            current.append(char)
++            escaped = False
++            continue
++
++        if char == "\\":
++            escaped = True
++            continue
++
++        if char == ":":
++            fields.append("".join(current))
++            current = []
++            continue
++
++        current.append(char)
++
++    fields.append("".join(current))
++    return fields
++
++
++def _normalise_security(value):
++    value = re.sub(r"\s+", " ", (value or "").strip())
++    if not value or value == "--":
++        return "Open"
++    return value
++
++
++def _signal_from_dbm(dbm):
++    # Map typical Wi-Fi RSSI to a user-facing 0-100 quality number.
++    # -90 dBm is practically unusable, -30 dBm is excellent/nearby.
++    try:
++        value = float(dbm)
++    except Exception:
++        return 0
++
++    if value <= -90:
++        return 0
++    if value >= -30:
++        return 100
++    return int(round((value + 90) * 100 / 60))
++
++
++def _normalise_network(ssid, signal=0, security=""):
++    ssid = (ssid or "").strip()
++    if not ssid:
++        return None
++
++    try:
++        signal = int(float(signal or 0))
++    except Exception:
++        signal = 0
++
++    signal = max(0, min(100, signal))
++    security = _normalise_security(security)
++
++    return {
++        "ssid": ssid,
++        "signal": signal,
++        "security": security,
++        "isOpen": security.lower() == "open",
++    }
++
++
++def _dedupe_and_sort(networks):
++    by_ssid = {}
++
++    for network in networks or []:
++        item = _normalise_network(
++            network.get("ssid"),
++            network.get("signal"),
++            network.get("security"),
++        )
++        if not item:
++            continue
++
++        existing = by_ssid.get(item["ssid"])
++        if existing is None or item["signal"] > existing["signal"]:
++            by_ssid[item["ssid"]] = item
++
++    return sorted(
++        by_ssid.values(),
++        key=lambda item: (-item["signal"], item["ssid"].lower()),
++    )
++
++
++def scan_with_nmcli(interface=WIFI_INTERFACE, rescan=True):
++    cmd = [
++        "nmcli",
++        "-t",
++        "--escape",
++        "yes",
++        "-f",
++        "SSID,SIGNAL,SECURITY",
++        "device",
++        "wifi",
++        "list",
++        "ifname",
++        interface,
++        "--rescan",
++        "yes" if rescan else "no",
++    ]
++
++    result = _run(cmd, timeout=16)
++    if result.returncode != 0:
++        raise RuntimeError((result.stderr or result.stdout or "nmcli Wi-Fi scan failed").strip())
++
++    networks = []
++    for line in (result.stdout or "").splitlines():
++        if not line.strip():
++            continue
++
++        fields = _split_nmcli_escaped(line)
++        while len(fields) < 3:
++            fields.append("")
++
++        item = _normalise_network(fields[0], fields[1], fields[2])
++        if item:
++            networks.append(item)
++
++    return _dedupe_and_sort(networks)
++
++
++def scan_with_iw(interface=WIFI_INTERFACE, ap_force=True):
++    cmd = ["iw", "dev", interface, "scan"]
++    if ap_force:
++        cmd.append("ap-force")
++
++    result = _run(cmd, timeout=16)
++    if result.returncode != 0:
++        raise RuntimeError((result.stderr or result.stdout or "iw Wi-Fi scan failed").strip())
++
++    networks = []
++    current = None
++
++    def finish_current():
++        if current:
++            item = _normalise_network(
++                current.get("ssid"),
++                current.get("signal"),
++                current.get("security"),
++            )
++            if item:
++                networks.append(item)
++
++    for raw_line in (result.stdout or "").splitlines():
++        line = raw_line.strip()
++
++        if line.startswith("BSS "):
++            finish_current()
++            current = {"ssid": "", "signal": 0, "security": "Open", "privacy": False}
++            continue
++
++        if current is None:
++            continue
++
++        if line.startswith("SSID:"):
++            current["ssid"] = line.split("SSID:", 1)[1].strip()
++            continue
++
++        if line.startswith("signal:"):
++            match = re.search(r"-?\d+(?:\.\d+)?", line)
++            if match:
++                current["signal"] = _signal_from_dbm(match.group(0))
++            continue
++
++        if line.startswith("capability:") and "Privacy" in line:
++            current["privacy"] = True
++            if current.get("security") == "Open":
++                current["security"] = "Secured"
++            continue
++
++        if line.startswith("RSN:"):
++            current["security"] = "WPA2/WPA3"
++            continue
++
++        if line.startswith("WPA:"):
++            current["security"] = "WPA/WPA2"
++            continue
++
++    finish_current()
++    return _dedupe_and_sort(networks)
++
++
++def _cache_payload(networks, source="unknown", error=""):
++    return {
++        "createdAt": _now_utc_iso(),
++        "createdAtUnix": time.time(),
++        "interface": WIFI_INTERFACE,
++        "source": source,
++        "error": error or "",
++        "networks": _dedupe_and_sort(networks),
++    }
++
++
++def _write_cache_file(path, payload):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
++    try:
++        os.chmod(path, 0o644)
++    except Exception:
++        pass
++
++
++def _read_wifi_scan_file(path, include_stale=True):
++    try:
++        if not path.exists():
++            return [], None
++
++        data = json.loads(path.read_text(encoding="utf-8"))
++        created_at_unix = float(data.get("createdAtUnix") or 0)
++        age_seconds = max(0, int(time.time() - created_at_unix)) if created_at_unix else None
++        is_stale = age_seconds is None or age_seconds > WIFI_SCAN_MAX_AGE_SECONDS
++
++        if is_stale and not include_stale:
++            return [], None
++
++        networks = _dedupe_and_sort(data.get("networks") or [])
++        meta = {
++            "createdAt": data.get("createdAt") or "",
++            "createdAtUnix": created_at_unix,
++            "ageSeconds": age_seconds,
++            "isStale": is_stale,
++            "source": data.get("source") or "cache",
++            "error": data.get("error") or "",
++            "path": str(path),
++        }
++        return networks, meta
++    except Exception as exc:
++        return [], {"error": f"Could not read cached Wi-Fi scan from {path}: {exc}", "isStale": True}
++
++
++def read_wifi_scan_cache(include_stale=True, prefer_last_good=True):
++    networks, meta = _read_wifi_scan_file(WIFI_SCAN_CACHE_PATH, include_stale=include_stale)
++    if networks:
++        return networks, meta
++
++    if prefer_last_good:
++        last_good, last_good_meta = _read_wifi_scan_file(WIFI_SCAN_LAST_GOOD_PATH, include_stale=include_stale)
++        if last_good:
++            if meta and meta.get("error") and not last_good_meta.get("error"):
++                last_good_meta["error"] = meta.get("error")
++            last_good_meta["source"] = "last-good"
++            return last_good, last_good_meta
++
++    return networks, meta
++
++
++def write_wifi_scan_cache(networks, source="unknown", error="", update_last_good=True):
++    networks = _dedupe_and_sort(networks)
++    payload = _cache_payload(networks, source=source, error=error)
++    _write_cache_file(WIFI_SCAN_CACHE_PATH, payload)
++
++    # Keep a separate last-known-good copy. Refresh while QRelia-Setup AP is
++    # running can legitimately return no rows on a single wlan0 radio; that
++    # must never destroy the useful scan captured before AP mode started.
++    if networks and update_last_good:
++        _write_cache_file(WIFI_SCAN_LAST_GOOD_PATH, payload)
++
++    return networks
++
++
++def refresh_wifi_network_cache(interface=WIFI_INTERFACE, allow_iw_fallback=True, preserve_existing_on_empty=True):
++    errors = []
++    previous_networks, _ = read_wifi_scan_cache(include_stale=True, prefer_last_good=True)
++
++    try:
++        networks = scan_with_nmcli(interface=interface, rescan=True)
++        if networks:
++            return write_wifi_scan_cache(networks, source="nmcli"), "nmcli", ""
++        errors.append("nmcli returned no nearby Wi-Fi networks")
++    except Exception as exc:
++        errors.append(str(exc))
++
++    if allow_iw_fallback:
++        try:
++            networks = scan_with_iw(interface=interface, ap_force=True)
++            if networks:
++                return write_wifi_scan_cache(networks, source="iw"), "iw", ""
++            errors.append("iw returned no nearby Wi-Fi networks")
++        except Exception as exc:
++            errors.append(str(exc))
++
++    error = " | ".join(error for error in errors if error) or "No Wi-Fi scan result returned."
++
++    if preserve_existing_on_empty and previous_networks:
++        return previous_networks, "last-good", error
++
++    write_wifi_scan_cache([], source="failed", error=error, update_last_good=False)
++    return [], "failed", error
++
++
++def get_wifi_networks(force_refresh=False):
++    if not force_refresh:
++        cached, meta = read_wifi_scan_cache(include_stale=False)
++        if cached:
++            return cached, meta or {"source": "cache"}, ""
++
++    networks, source, error = refresh_wifi_network_cache(allow_iw_fallback=True)
++    cached, meta = read_wifi_scan_cache(include_stale=True)
++    if networks:
++        return networks, {"source": source, **(meta or {})}, error
++
++    return cached, meta or {"source": source, "error": error}, error
+diff --git a/systemd/qrelia-network-watchdog.service b/systemd/qrelia-network-watchdog.service
+new file mode 100644
+index 0000000..e27e1cd
+--- /dev/null
++++ b/systemd/qrelia-network-watchdog.service
+@@ -0,0 +1,17 @@
++[Unit]
++Description=QRelia network recovery watchdog
++After=NetworkManager.service
++Wants=NetworkManager.service
++
++[Service]
++Type=simple
++User=root
++WorkingDirectory=/home/qrelia/qrelia/setup
++Environment=PYTHONUNBUFFERED=1
++Environment=QRELIA_DISPLAY_STATE_FILE=/tmp/qrelia_display_state.json
++ExecStart=/home/qrelia/qrelia/.venv/bin/python /home/qrelia/qrelia/setup/qrelia_network_watchdog.py
++Restart=always
++RestartSec=3
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/systemd/qrelia-reset-button.service b/systemd/qrelia-reset-button.service
+new file mode 100644
+index 0000000..d3ff427
+--- /dev/null
++++ b/systemd/qrelia-reset-button.service
+@@ -0,0 +1,20 @@
++[Unit]
++Description=QRelia hardware reset button watcher
++After=multi-user.target
++Wants=multi-user.target
++
++[Service]
++Type=simple
++User=root
++WorkingDirectory=/home/qrelia/qrelia/setup
++Environment=PYTHONUNBUFFERED=1
++Environment=QRELIA_RESET_BUTTON_GPIO=26
++Environment=QRELIA_RESET_BUTTON_HOLD_SECONDS=7
++Environment=QRELIA_DISPLAY_STATE_FILE=/tmp/qrelia_display_state.json
++Environment=QRELIA_HARD_RESET_SCRIPT=/home/qrelia/qrelia/setup/qrelia_hard_reset_network.sh
++ExecStart=/home/qrelia/qrelia/.venv/bin/python /home/qrelia/qrelia/setup/qrelia_network_reset_button.py
++Restart=always
++RestartSec=2
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/systemd/qrelia-setup-mode.service b/systemd/qrelia-setup-mode.service
+new file mode 100644
+index 0000000..67eef7b
+--- /dev/null
++++ b/systemd/qrelia-setup-mode.service
+@@ -0,0 +1,22 @@
++[Unit]
++Description=QRelia LCD captive setup mode
++After=NetworkManager.service
++Wants=NetworkManager.service
++
++[Service]
++Type=simple
++User=root
++WorkingDirectory=/home/qrelia/qrelia/setup
++Environment=PYTHONUNBUFFERED=1
++Environment=QRELIA_DISPLAY_STATE_FILE=/tmp/qrelia_display_state.json
++Environment=QRELIA_DEVICE_CONFIG_PATH=/home/qrelia/qreliadevice/qrelia_device_config.json
++Environment=QRELIA_PROVISIONING_PATH=/home/qrelia/qreliadevice/provisioning.json
++Environment=QRELIA_PROVISIONING_FAILURE_PATH=/home/qrelia/qreliadevice/provisioning_error.json
++Environment=QRELIA_WIFI_SETUP_PENDING_PATH=/home/qrelia/qreliadevice/wifi_setup_pending.json
++Environment=QRELIA_WIFI_SETUP_FAILURE_PATH=/home/qrelia/qreliadevice/wifi_setup_error.json
++ExecStart=/home/qrelia/qrelia/.venv/bin/python /home/qrelia/qrelia/setup/qrelia_setup_mode.py
++Restart=on-failure
++RestartSec=3
++
++[Install]
++WantedBy=multi-user.target
