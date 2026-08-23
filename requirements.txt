@@ -1,0 +1,4 @@
+requests>=2.31,<3
+websockets>=12,<16
+pygame>=2.5,<3
+rpi-ws281x>=5,<6

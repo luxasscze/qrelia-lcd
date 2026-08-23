@@ -1,0 +1,24 @@
+[Unit]
+Description=QRelia LCD Ambient Device
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/qrelia/qrelia
+ExecStart=/usr/bin/python3 /home/qrelia/qrelia/qrelia_tenant.py
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+Environment=QRELIA_LCD_FPS=30
+# Keep compatibility with the existing production device identity/provisioning
+# written by the original QRelia setup stack.
+Environment=QRELIA_DEVICE_CONFIG_PATH=/home/qrelia/qreliadevice/qrelia_device_config.json
+Environment=QRELIA_PROVISIONING_PATH=/home/qrelia/qreliadevice/provisioning.json
+Environment=QRELIA_PROVISIONING_FAILURE_PATH=/home/qrelia/qreliadevice/provisioning_error.json
+Environment=QRELIA_PROFILE_PATH=/home/qrelia/qreliadevice/ambient_profile.json
+Environment=QRELIA_CONTROL_PLANE_STATUS_PATH=/home/qrelia/qreliadevice/qrelia_cloud_control_status.json
+
+[Install]
+WantedBy=multi-user.target
